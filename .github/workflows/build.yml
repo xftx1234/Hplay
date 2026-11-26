@@ -1,0 +1,160 @@
+# 本工作流未在真实 GitHub Runner 上实测，若失败请以本地 tools/publish_github.py 为准。
+#
+# 为什么单独写这一句：本工程的构建管线是纯 SDK 命令行（python build.py），
+# 依赖 工具/ 下一整套 JDK + kotlinc + build-tools + 77 个 AAR 解包出来的 classes.jar。
+# 本机能跑通不等于 Runner 上一样（路径、可执行位、aapt2 的窄字符限制都会变），
+# 所以 CI 只是一条便利通道，发布口径永远以本地 publish_github.py 的产物为准。
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      line:
+        description: "发布线（lab = 实验版 / stable = 主线版）"
+        required: true
+        default: lab
+        type: choice
+        options:
+          - lab
+          - stable
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Short SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Android cmdline-tools
+        run: |
+          set -eux
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          cd "$HOME/android-sdk/cmdline-tools"
+          curl -fsSL -o cmdline.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q cmdline.zip
+          mv cmdline-tools latest
+          "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --version
+
+      - name: sdkmanager install platforms and build-tools
+        run: |
+          set -eux
+          export ANDROID_HOME="$HOME/android-sdk"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;34.0.0" "build-tools;35.0.0" "platform-tools"
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+
+      - name: Download Kotlin 2.4.20 compiler
+        run: |
+          set -eux
+          mkdir -p 工具/avp_kotlinc24
+          cd 工具/avp_kotlinc24
+          curl -fsSL -o kotlin.zip https://github.com/JetBrains/kotlin/releases/download/v2.4.20/kotlin-compiler-2.4.20.zip
+          unzip -q kotlin.zip
+          rm -f kotlin.zip
+          chmod +x kotlinc/bin/*
+          ls -l kotlinc/bin/kotlinc kotlinc/lib/compose-compiler-plugin.jar
+
+      - name: Link toolchain into build.py expected layout
+        run: |
+          set -eux
+          export ANDROID_HOME="$HOME/android-sdk"
+          APP=工程/Hplay安卓
+
+          mkdir -p 工具/android-build/bt 工具/android-build/bt35 工具/android-build/platforms
+          mkdir -p 工具/jdk-temurin 工具/android-deps
+
+          # build-tools 34 -> 工具/android-build/bt/android-14（aapt2 / aapt / zipalign / apksigner.jar）
+          ln -sfn "$ANDROID_HOME/build-tools/34.0.0" 工具/android-build/bt/android-14
+          # build-tools 35 -> 工具/android-build/bt35/android-15（只取 lib/d8.jar）
+          ln -sfn "$ANDROID_HOME/build-tools/35.0.0" 工具/android-build/bt35/android-15
+          # platform-35 的 android.jar
+          ln -sfn "$ANDROID_HOME/platforms/android-35" 工具/android-build/platforms/android-35
+          # JDK：build.py 认 工具/jdk-temurin/jdk-21.0.12.1+1/bin/java.exe
+          ln -sfn "$JAVA_HOME" "工具/jdk-temurin/jdk-21.0.12.1+1"
+
+          # build.py 里的工具名全是 Windows 的 .exe 形式，Linux 上补同名软链
+          for t in java javac jar keytool; do
+            ln -sfn "$JAVA_HOME/bin/$t" "工具/jdk-temurin/jdk-21.0.12.1+1/bin/$t.exe"
+          done
+          for t in aapt2 aapt zipalign; do
+            ln -sfn "$ANDROID_HOME/build-tools/34.0.0/$t" "工具/android-build/bt/android-14/$t.exe"
+          done
+          # kotlinc：build.py 调 kotlinc.bat，Linux 上让它等于 kotlinc 启动脚本
+          cp 工具/avp_kotlinc24/kotlinc/bin/kotlinc 工具/avp_kotlinc24/kotlinc/bin/kotlinc.bat
+          chmod +x 工具/avp_kotlinc24/kotlinc/bin/kotlinc.bat
+
+          # build.py 的 ensure_junction() 只会在 Windows 上 mklink，这里先把两条联接建好
+          mkdir -p "$APP/build"
+          ln -sfn "$(pwd)/工具" "$APP/build/tool"
+          ln -sfn "$ANDROID_HOME/platforms/android-35" "$APP/build/sdkjar"
+
+          echo "--- 布局检查 ---"
+          ls -l 工具/android-build/bt/android-14/aapt2.exe
+          ls -l 工具/android-build/bt35/android-15/lib/d8.jar
+          ls -l 工具/android-build/platforms/android-35/android.jar
+          ls -l "工具/jdk-temurin/jdk-21.0.12.1+1/bin/java.exe"
+          ls -l 工具/avp_kotlinc24/kotlinc/bin/kotlinc.bat
+          ls -l "$APP/build/tool" "$APP/build/sdkjar"
+          # build.py 的 WS = ROOT.parent.parent 必须等于仓库根，否则找不到 工程/AvPlay
+          test -f 工程/AvPlay/独立版/hplay-adrules.txt
+
+      - name: Fetch AndroidX dependencies
+        run: |
+          set -eux
+          APP=工程/Hplay安卓
+          # fetch_deps.py 的 OUT 写死成 Windows 绝对路径，改成仓库根的 工具/android-deps
+          sed -i 's|^OUT = r".*"$|OUT = "工具/android-deps"|' "$APP/tools/fetch_deps.py"
+          grep -n '^OUT = ' "$APP/tools/fetch_deps.py"
+          python3 "$APP/tools/fetch_deps.py"
+          wc -l 工具/android-deps/manifest.txt
+
+      - name: Patch precheck
+        run: |
+          set -eux
+          cd 工程/Hplay安卓
+          python3 tools/patchguard.py
+
+      - name: Build APK
+        env:
+          HPLAY_GH_REPO: ${{ github.repository }}
+          HPLAY_GH_LINE: ${{ inputs.line }}
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          set -eux
+          cd 工程/Hplay安卓
+          python3 build.py --release --no-deploy
+          ls -l apk/
+
+      - name: Upload APK to ci-<sha> prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci-${{ env.SHORT_SHA }}
+          name: Hplay CI ${{ env.SHORT_SHA }}
+          prerelease: true
+          draft: false
+          body: |
+            CI 构建快照（workflow_dispatch 触发）
+
+            - 发布线：${{ inputs.line }}
+            - 提交：${{ github.sha }}
+            - Runner：${{ runner.os }} / ${{ runner.arch }}
+          files: |
+            工程/Hplay安卓/apk/*.apk

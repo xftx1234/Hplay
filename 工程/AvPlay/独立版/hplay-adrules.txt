@@ -1,0 +1,133 @@
+! Hplay AdGuard 模块 · 规则文件
+! 1) !ads=<正则>：广告域名正则（识别广告图 / 广告 iframe）
+! 2) selector：通用元素隐藏规则
+! 3) domain##selector：按域名元素隐藏规则
+! 来源：EasyList Adult（adult_specific_hide / adult_adservers / adult_thirdparty）+ 实测补充
+!ads=18naked.com|18onlygirls.tv|365.freeonlinegayporn.com|3xplanetimg2.com|3xtraffic.com|444.thebussybandit.com|4link.it|4tube.com|69games.xxx|777\-partner.com|777\-partner.net|777\-partners.com|777\-partners.net|777partner.com|777partner.net|777partners.com|879.thebussybandit.com|a.aylix.xyz|a.cylek.site|a.gemen.site|a.hymin.xyz|a.jamni.xyz|a.teencfnm.com|a.xvidxxx.com|a1tb.com|acmexxx.com|ad.eroplay.tech|ad2.freeasianmovies.cam|ad7.cuteasianvideos.store|ad8.hottestasians.pics|adcell.de|adextrem.com|ads\-adv.top|adsarcade.com|adsession.com|adshnk.com|adspector.io|adspy.hdthot.com|adsturn.com|adult.xyz|adult3dcomics.com|adultforce.com|adultfriendfinder.com|adultsense.com|aemediatraffic.com|aff\-jp.dxlive.com|affiliate.dtiserv.com|affiliates.thrixxx.com|affiliaxe.com|affiligay.net|aipmedia.com|allosponsor.com|am.justtube.net|amarotic.com|amateur.tv|amateurhub.cam|amateurporn.net|ams.lustytube.net|anacams.com|api.bluerunningshadow.com|api.dancedogwhisper.com|api.fastmoonclimbed.com|app.189tutors.com|app.phimvu.app|apps.dfgtfv.com|apu.hentaibox.xyz|as1.maturexxx.vip|as3.hotasiangirl.xyz|asg.aphex.me|asg.bhabhiporn.pro|horribletrainer.com|magsrv.com|wheelroot.com|myavlive.com|animeplayhub.com|frozenpayerpregnant.com|quizzical-topic.com|footbathmockerpurse.com
+ins[data-zoneid]
+ins[class*=eas]
+.ad-provider
+[id^=btmad]
+.adsbygoogle
+[class*=ad-container]
+[id*=ad-container]
+[class*=popunder]
+[class*=pop-under]
+[class*=banner-ad]
+[class*=advert]
+[class*=sponsor]
+[class*=promo-box]
+[class*=float-ad]
+[class*=fixed-ad]
+[id*=ad-slot]
+[class*=player-ad]
+! 播放器/广告位上的透明点击劫持层（MissAV 等站点第三方广告脚本自标 data-cl-overlay，覆盖播放器吞掉播放键点击）
+[data-cl-overlay]
+njav.com###ad300250
+mobxvideos.com,pornogramxxx.com###bubble
+pornhub.com,youporn.com###pb_template
+missav.to###poster
+missav.to,tojav.net###preroll
+xvideos.name###publicidad-video
+pornhub.com###singleFeedSection > .emptyBlockSpace
+xvideos.com###video-right
+xvideos.com###video-sponsor-links
+xhamster.com##._029ef-containerBottomSpot
+xhamster.com##._80e65-containerBottomSpot
+xhamster.com##._80e65-containerPauseSpot
+xhamster.com##.auto-generated-banner-container
+18teensex.tv,3movs.xxx,adultdeepfakes.com,babesmachine.com,chaturbate.com,daftporn.com,fboomporn.com,freepornpicss.com,gramateurs.com,happysex.ch,hdtube.porn,its.porn,kawaiihentai.com,milffox.com,oldies.name,paradisehill.cc,playporngames.com,playsexgames.xxx,playvids.com,porngames.com,private.com,submittedgf.com,teenextrem.com,video.laxd.com,vikiporn.com,vjav.com,watchhentaivideo.com,waybig.com,xbabe.com,xcum.com,xnudepics.com,youcanfaptothis.com,yourdailygirls.com,youx.xxx##.banner
+hanime.tv##.banner-ad-container
+xhamster.com##.bottom-widget-section
+xnxxvideos.rest##.camitems
+xhamster.com##.clipstore-bottom
+bdsmx.tube,desi-porn.tube,hclips.com,hdzog.com,hdzog.tube,hotmovs.com,inporn.com,upornia.com,upornia.tube,vjav.com,vjav.tube,vxxx.com##.fah-btn
+njavtv.com##.fixed.right-2.bottom-2
+tubator.com##.ggg_container
+sexseeimage.com,thisav.me##.happy-player-beside
+sexseeimage.com,thisav.me##.happy-player-under
+sexseeimage.com,thisav.me##.happy-section
+thisav.me##.img-ads
+babesandstars.com,pornhubpremium.com##.join
+pornhub.com,pornhub.org##.js_promoItem
+vjav.*##.jw-buble.nopop
+senzuri.*,shemalez.*,vjav.*##.jw-hardlink-inner
+missav.*,missav123.com,missav888.com,njavtv.com##.lg\:block
+missav.*,missav123.com,missav888.com##.lg\:hidden
+xnxxvideos.rest##.mult
+jable.tv##.nav-item > a[target="_blank"]
+xv-ru.com,xvideos.*##.nutaku-gamesAdd commentMore actions
+xhamster.com##.player-add-overlay
+xvideos.com,xvideos.es##.player-video.xv-cams-block
+xnxxvideos.rest##.prefixat-player-promo-col
+xhamster.com##.promo-message
+pornhub.com,pornhub.org##.realsex
+xnxxvideos.rest##.refr
+jable.tv##.right-sidebar > .mb-e-30
+pornhub.com##.sideAds
+pornhub.com,pornhub.org##.sniperModeEngaged
+18porn.sex,anyporn.com,area51.porn,bigtitslust.com,eachporn.com,fapster.xxx,fpo.xxx,freeporn8.com,hentai-moon.com,hentai0day.com,its.porn,izlesimdiporno.com,mmshub.online,pervertslut.com,porngem.com,pornmeka.com,porntop.com,sexvid.xxx,sortporn.com,tktube.com,uiporn.com,xhamster.com##.sponsor
+3movs.com,3movs.xxx,babepump.com,bravotube.net,camvideos.tv,cluset.com,deviants.com,dixyporn.com,fapnfuck.com,fuqster.com,hello.porn,homo.xxx,javcab.com,katestube.com,pornicom.com,sexpester.com,sleazyneasy.com,thefree3dporn.com,videocelebs.net,vikiporn.com,vjav.com,w1mp.com,w4nkr.com##.spot
+xnxx.com,xvideos.com##.thumb-ad
+vjav.com,vjav.tube##.undp
+xvideos.com##.video-ad
+xhamster.com##.video-view-ads
+xhamster.com##.wio-p
+xhamster.com##.wio-pcam-thumb
+xhamster.com##.wio-psp-b
+xhamster.com,xhamster2.com##.wio-xbanner
+xhamster2.com##.wio-xspa
+xhamster.com##.wixx-ebanner
+xhamster.com##.wixx-ecam-thumb
+xhamster.com##.wixx-ecams-widget
+xhamster.com##.xplayer-b
+xhamster.com##.xplayer-hover-menu
+xhamster.com##.yfd-fdcam-thumb
+xhamster.com##.yfd-fdcams-widget
+xhamster.com##.yfd-fdclipstore-bottom
+xhamster.com##.yfd-fdsp-b
+xhamster.com##.yld-mdcam-thumb
+xhamster.com##.yld-mdsp-b
+xhamster.com##.yld-pcxplayer-hover-menu
+xhamster.com##.ytd-jcam-thumb
+xhamster.com##.ytd-jcams-widget
+xhamster.com##.ytd-jsp-a
+xhamster.com##.yxd-jcam-thumb
+xhamster.com##.yxd-jcams-widget
+xhamster.com##.yxd-jdbanner
+xhamster.com##.yxd-jdcam-thumb
+xhamster.com##.yxd-jdcams-widget
+xhamster.com##.yxd-jdplayer
+xhamster.com##.yxd-jdsp-b
+xhamster.com##.yxd-jdsp-l-tab
+xhamster.com##.yxd-jsp-a
+xhamster.com,xhamster.one,xhamster2.com##[class^="xplayer-banner"]
+pornhub.com,redtube.com,tube8.com,tube8.es,tube8.fr,xvideos.com,youjizz.com,youporn.com##[href*="base64"]
+pornhub.com,redtube.com,tube8.com,tube8.es,tube8.fr,xvideos.com,youjizz.com,youporn.com##[href*="data:"]
+asianpornjav.com##[href="https://asianpornwebsites.com/"]
+pornhub.com##[srcset*="bloB:"]
+pornhub.com,redtube.com,tube8.com,tube8.es,tube8.fr,youjizz.com,youporn.com##[style*="base64"]
+vjav.com##[style="width: 728px; height: 90px;"]
+missav.*,missav123.com,missav888.com,njavtv.com##[style^="width: 300px; height: 250px;"]
+missav.*,missav123.com,missav888.com##[x-show$="video_details'"] > div > .list-disc
+pornhub.com##a[data-event="header_paid_tabs"]
+asspoint.com,babepedia.com,babesandstars.com,dbnaked.com,freeones.com,gfycatporn.com,mansurfer.com,newpornstarblogs.com,ok.porn,porn-star.com,porn.com,porndoe.com,pornhubpremium.com,pornstarchive.com,rogreviews.com,sexyandfunny.com,shemaletubevideos.com,spankbang.com,str8upgayporn.com,the-new-lagoon.com,tube8.com,wcareviews.com,xxxonxxx.com,youporn.com##a[href*=".com/track/"]
+boyfriend.tv,boyfriendtv.com,hentaigasm.com,masahub.net,missav.ai,missav.ws,missav123.com,missav888.com,phun.org,porn-w.org##a[href*="//bit.ly/"]
+pornhub.com,pornhubpremium.com,spankbang.com,sxyprn.com,tube8.com,tube8vip.com,xozilla.com,xxxymovies.com##a[href*="?ats="]
+f95zone.to,pornhub.com,pornhubpremium.com,redtube.com##a[href^="https://ads.trafficjunky.net/"]
+valuexh.life,xhaccess.com,xhamster.com,xhamster.desi,xhamster2.com,xhamster3.com,xhamster42.desi,xhbig.com,xhbranch5.com,xhchannel.com,xhdate.world,xhofficial.com,xhspot.com,xhtotal.com,xhwide2.com##a[href^="https://flirtify.com/"]
+pornhub.com##a[href^="https://www.uviu.com"]
+boobieblog.com,imgadult.com,lolhentai.net,picdollar.com,porngames.com,thenipslip.com,wetpussygames.com,xvideos.name##canvas
+galleryxh.site,megaxh.com,openxh.com,stripchat.com,valuexh.life,xhaccess.com,xhamster.com,xhamster.desi,xhamster.one,xhamster1.desi,xhamster13.*,xhamster14.com,xhamster16.*,xhamster17.*,xhamster18.*,xhamster19.com,xhamster2.com,xhamster20.desi,xhamster3.*,xhamster37.com,xhamster40.com,xhamster42.desi,xhamster9.com,xhbig.com,xhbranch5.com,xhchannel.com,xhdate.world,xhmoon5.com,xhofficial.com,xhopen.com,xhspot.com,xhtotal.com,xhvid.com,xhwide1.com,xhwide2.com##div[class*="cams-wgt"]
+xhamster.com##div[data-testid="right-banner-section"]
+darknessporn.com,familyporner.com,freepublicporn.com,pisshamster.com,punishworld.com,xanimu.com##div[id^="after-boxes"]
+darknessporn.com,familyporner.com,freepublicporn.com,pisshamster.com,punishworld.com,xanimu.com##div[id^="beside-video"]
+darknessporn.com,familyporner.com,freepublicporn.com,pisshamster.com,punishworld.com,xanimu.com##div[id^="native-boxes"]
+darknessporn.com,familyporner.com,freepublicporn.com,pisshamster.com,punishworld.com,xanimu.com##div[id^="related-boxes-footer"]
+pornhub.com##div[onclick*="bp1.com"]
+abxxx.com,aniporn.com,missav.ai,missav.ws,missav123.com,missav888.com##div[style="width: 300px; height: 250px;"]
+pornhub.com##img[srcset]
+mature.community,milf.community,milf.plus,pornhub.com##img[width="300"]
+! 站点自有广告位 iframe（/herebyad1..4、/HereByAD1）：广告内容与点击层同源，直接隐藏
+missav,njav,thisav##iframe[src*="erebyad"],iframe[src*="ereByAD"]
+

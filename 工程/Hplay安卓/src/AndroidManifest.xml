@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- versionCode/versionName 故意不在这里声明：aapt2 link 只在 manifest 未声明时才注入
+     build.py 的值，build.py 是版本号的唯一事实源（沿用 quder 实测管线约定）。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.han1me.app">
+
+    <!-- 站点数据/视频流（https 为主）；usesCleartextTraffic 兼容个别 http 线路与本地页面 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 第 45 轮「本地下载」：用户可把保存目录指到公共下载目录。
+         Android 9 及以下靠这条权限（maxSdkVersion=28 让 10+ 不再申请它）；
+         10 及以上受分区存储限制，界面上的写探针会如实报"不能写入"，不会假装存进去了。 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <!-- 第 48 轮「后台继续下载」：应用退到后台之后要接着下，必须挂前台服务。
+         这是 Android 的正规做法 —— 普通线程会随进程被回收（上一版就是那样中断的）。
+         Android 14 起 dataSync 类型的服务必须显式声明 FOREGROUND_SERVICE_DATA_SYNC。 -->
+    <!-- 第 57 轮：后台下载**降速**的头号原因是息屏后 CPU 休眠。
+         前台服务只保证「进程不被回收」，不保证「CPU 不休眠」——
+         必须自己持有 PARTIAL_WAKE_LOCK 才能让下载在息屏时保持速度。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 下载进度通知（Android 13+ 需用户授权；没授权只影响通知是否可见，不影响下载继续跑）。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- ★ 2026-11-26（第 331 轮 · 用户要求「设置应用内下载更新弹窗，点击下载后后台通知栏下载
+         并且显示进度」）：**应用内下载 APK 并直接拉起系统安装器**。
+
+         为什么必须声明这条：Android 8.0（API 26）起，用 Intent 拉起
+         application/vnd.android.package-archive 之前，调用方必须持有
+         REQUEST_INSTALL_PACKAGES，否则系统直接抛 ActivityNotFoundException
+         （对用户就是「点了没反应」）。用户装过一次之后系统会记住这个授权。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- 第 71 轮（真实事故修复）：**读取公共「下载」目录里的已下载视频**。
+         
+         起因：targetSdk=34 走严格分区存储，而本应用此前**没有声明任何公共目录读取权限** ——
+         用户把保存目录指到 /storage/emulated/0/Download/Hplay 视频 后，应用 listFiles() 拿不到内容，
+         于是「已下载」里全部显示 0 B / 无封面（用户报的「视频和介绍页都没了」）。
+         本机实测：清理应用数据（权限被重置）后必现；此前能看是历史遗留的授权在兜着。
+         
+         · MANAGE_EXTERNAL_STORAGE（「所有文件访问」）：读下载目录的**唯一可靠办法** ——
+           分区存储下，非媒体文件（.ts 分片、.m3u8、我们自己写的 .detail.json）用媒体权限读不到；
+           用户需在系统设置里放行一次（界面会给出入口按钮）。
+         · READ_MEDIA_VIDEO / READ_EXTERNAL_STORAGE：作为**次选**，只覆盖标准视频文件（.mp4 等）；
+           Android 13+ 用 READ_MEDIA_VIDEO，12 及以下用 READ_EXTERNAL_STORAGE。
+         三者在运行时按 SDK 判断申请，界面上**如实显示当前是否已获批**。 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <application
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="false"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.Hplay">
+
+        <!-- 第 46 轮「外部播放器」：本机下载的视频要交给系统播放器播放。
+             Android 7.0 起 file:// 会抛 FileUriExposedException，只能走 content://。
+             exported=false + grantUriPermissions=true：只有我们显式发出的那一个 URI 可被临时读。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.han1me.app.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- 第 48 轮「后台继续下载」的前台服务。exported=false：只有本应用能拉起它。 -->
+        <service
+            android:name="com.han1me.download.DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- ★ 2026-11-26（第 331 轮）：**APK 更新包的后台下载服务**。
+             与上面的 DownloadService 是两个不同的东西：
+               · DownloadService  = 站点视频（HLS 分片，多任务，可暂停续传）
+               · UpdateService    = App 自己的新版本 APK（单文件，下完直接拉安装器）
+             分成两个服务的理由：视频下载队列会被「取消全部 / 清空已完成」这类操作
+             整体清掉，而**更新包不能因为用户清下载记录就丢**；反过来更新包下完要
+             自动跳安装器，不该混进视频列表。两者互不干扰。
+             exported=false：只允许本应用拉起。 -->
+        <service
+            android:name="com.han1me.update.UpdateService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <activity
+            android:name="com.han1me.MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|fontScale|locale|layoutDirection|uiMode"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ★ 2026-11-24（第 277 轮 · CF 质询）：Cloudflare 验证页。
+             独立 Activity 是刻意的 —— 它只在被盾拦住时临时弹出，
+             用完即走；混进主 Compose 导航反而要为一棵极小的界面引入路由负担。
+             不导出（exported=false）：只允许本应用内部启动。 -->
+        <activity
+            android:name="com.han1me.lab.CfVerifyActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|fontScale|locale|layoutDirection|uiMode"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- ★ 2026-11-25（第 285 轮 · 登录重做）：WebView 登录页。
+             参照 Han1mePlus login_page.dart / Han1meViewer LoginScreen.kt ——
+             两家都走 WebView 而不是表单 POST，因为 CF 环境下 POST 链路太脆。 -->
+        <activity
+            android:name="com.han1me.lab.LoginActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|fontScale|locale|layoutDirection|uiMode"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+            android:windowSoftInputMode="adjustResize" />
+    </application>
+
+    <!-- 第 73 轮（真实 bug 修复）：**外部播放器的包可见性**。
+         
+         为什么必须声明：Android 11（API 30）起有**包可见性限制** —— 应用默认只能看到
+         自己与少数系统包。用 PackageManager.queryIntentActivities() 去问「谁能放这个视频」时，
+         如果目标应用没有出现在 <queries> 里，**结果是空的**。
+         
+         真实症状：用户点「外部播放」没有弹出系统选择器，而且从「已下载」（content:// URI）
+         进介绍页时尤其明显 —— 因为能读 content:// 的播放器本就更少，再被包可见性过滤掉，
+         就成了「一个都找不到」。
+         
+         这里按**意图**声明（而不是按包名逐个列），让系统自己去解析：
+         任何能处理 ACTION_VIEW + video/* 的应用都对可见。这样不绑定具体播放器，
+         用户装什么就列什么（VLC / MX Player / nPlayer / 系统相册 / 文件管理器…）。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="video/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="audio/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="video/*" />
+        </intent>
+        <!-- 「用浏览器打开」这类在线直链条目也要能列出来 -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
+</manifest>
