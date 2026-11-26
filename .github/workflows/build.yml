@@ -140,7 +140,10 @@ jobs:
         run: |
           set -eux
           cd 工程/Hplay安卓
-          python3 build.py --release --no-deploy
+          # ★ --no-cred：CI 的产物会作为 Release asset 公开下载，
+          # 绝不能把 tools/139_cred.txt 编进去（仓库里本来也没有那个文件，
+          # 加上这个开关是**双保险**：万一将来有人把凭据提交上来，CI 也不会泄露）。
+          python3 build.py --release --no-deploy --no-cred
           ls -l apk/
 
       - name: Upload APK to ci-<sha> prerelease

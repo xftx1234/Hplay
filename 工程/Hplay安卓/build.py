@@ -214,6 +214,10 @@ def sha256_file(p: Path):
 #       并回落到自建网盘通道 —— 不会假装查过，也不会编译失败。
 YUN139_CRED = ROOT / "tools" / "139_cred.txt"
 
+# ★ 第 331 轮：公开发布时**禁止**把凭据编进 APK。
+# 由 --no-cred 或环境变量 HPLAY_NO_CRED=1 置位；tools/publish_github.py 与 CI 默认带。
+NO_CRED = os.environ.get("HPLAY_NO_CRED", "") in ("1", "true", "yes")
+
 
 def gen_yun139_credential():
     """生成 build/gen/Yun139Cred.kt（凭据注入）。**只写 build/ 下，不进 git。**
@@ -224,10 +228,25 @@ def gen_yun139_credential():
     为什么要多账号：旧版只存**一行**凭据，它一旦过期，139 直连就永远失败、
     每次都被迫回落到自建网盘（用户看到的就是「自建网盘兜底」那一行）。
     多账号让单个 token 失效不再让整条 139 路废掉。
+
+    ★★★ 第 331 轮（**公开分发前的硬拦截**）：
+
+    这一段原先无条件把 tools/139_cred.txt 的内容编进 dex —— 实测（逐条比对
+    凭据字节与 classes*.dex）**确实能在 classes2.dex 里原样找到**。
+    一旦这个 APK 发到 GitHub Release，等于把两个移动云盘账号的访问权公开。
+
+    所以加了 [--no-cred] / 环境变量 HPLAY_NO_CRED=1 的开关：
+      · **公开发布一律带这个开关**（tools/publish_github.py 与 CI 都默认带）；
+      · 本地自用构建不带，139 直连照旧可用。
+      · 不带凭据时 App 会**如实报「未配置 139 凭据」并回落到网盘/GitHub**，
+        不会崩、也不会假装查过 —— 这是既有的降级路径，不是新行为。
+
+    只靠 .gitignore 挡不住这件事：.gitignore 保护的是**源码仓库**，
+    而这里是**编译产物**，产物是二进制、无法被人一眼看出里面有没有凭据。
     """
     creds = []
     src = "none"
-    if YUN139_CRED.exists():
+    if YUN139_CRED.exists() and not NO_CRED:
         for line in YUN139_CRED.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
@@ -253,7 +272,10 @@ def gen_yun139_credential():
         "}\n"
     )
     (GEN / "Yun139Cred.kt").write_text(kt, encoding="utf-8")
-    print("  Yun139Cred.kt 凭据注入 = " + (str(len(creds)) + " 个账号" if creds else "**空**（未配置，将回落网盘通道）"))
+    if NO_CRED:
+        print("  Yun139Cred.kt 凭据注入 = **已禁用**（--no-cred：公开发布不内嵌凭据）")
+    else:
+        print("  Yun139Cred.kt 凭据注入 = " + (str(len(creds)) + " 个账号" if creds else "**空**（未配置，将回落网盘通道）"))
 
 
 def gen_build_info():
@@ -873,12 +895,18 @@ def badging(final):
 
 
 def main():
-    global VER_VALS
+    global VER_VALS, NO_CRED
     ap = argparse.ArgumentParser()
     ap.add_argument("--clean", action="store_true")
     ap.add_argument("--release", action="store_true", help="版本号 +1 并回写 version.properties")
     ap.add_argument("--no-deploy", action="store_true", help="不复制到 成品\\Hplay\\apk\\")
+    ap.add_argument("--no-cred", action="store_true",
+                    help="不把 tools/139_cred.txt 编进 APK（**公开发布必须带**；"
+                         "不带凭据时 App 会如实报未配置并回落网盘/GitHub）")
     args = ap.parse_args()
+
+    if args.no_cred:
+        NO_CRED = True
 
     for p, label in ((JAVA, "JDK"), (KOTLINC_BAT, "kotlinc"), (AAPT2, "aapt2"),
                      (ANDROID_JAR_SRC, "android.jar"), (DEPS, "deps")):
