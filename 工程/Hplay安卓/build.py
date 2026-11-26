@@ -945,7 +945,6 @@ def main():
         if not pusher.exists():
             print("  跳过：找不到 tools\\push_to_mea.py")
         else:
-            import subprocess
             PUSH_DIRS = [
                 "/移动云盘134/hplay",        # ① 默认通道
                 "/移动云盘195/hplay",        # ② 备用（139 家族另一个账号）
@@ -969,6 +968,45 @@ def main():
                 print("  !! 通道推送失败：" + "、".join(failed) + "（可用 tools\\push_to_mea.py --dir 手工补推）")
             else:
                 print("  4 通道全部已更新")
+
+        # ---- 第 331 轮：**同时发 GitHub Release**（用户要求「每次构建完成新版本
+        #      自动更新源码和发行版本」）----
+        #
+        # 顺序刻意放在网盘之后：网盘是国内用户的主通道，万一 GitHub 这边
+        # 卡在网络上（国内直连 GitHub 常常要几十秒），不该让国内那条路白等。
+        #
+        # 失败同样**不阻断构建**：APK 已在盘上、网盘也已更新；GitHub 那条路
+        # 失败只意味着「GitHub 渠道还是旧版」，把原因打出来让用户知道该修哪。
+        if not GH_REPO.startswith("OWNER/") and "/" in GH_REPO:
+            print("\n================ 发布到 GitHub Releases ================")
+            publisher = ROOT / "tools" / "publish_github.py"
+            if not publisher.exists():
+                print("  跳过：找不到 tools\\publish_github.py")
+            else:
+                # 先导出（把当前 src/tools/上游 同步到 发布/Hplay），再发布。
+                exporter = ROOT / "tools" / "export_github.py"
+                if exporter.exists():
+                    ex = subprocess.run([sys.executable, str(exporter)], cwd=str(ROOT),
+                                        capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    print("  导出：" + ("成功" if ex.returncode == 0 else "失败（继续发布已有内容）"))
+                    if ex.returncode != 0:
+                        for line in (ex.stderr or "").splitlines()[-6:]:
+                            print("     " + line)
+                pub = subprocess.run(
+                    [sys.executable, str(publisher),
+                     "--repo", GH_REPO,
+                     "--line", "lab" if GH_LINE == "lab" else "stable",
+                     "--apk", str(final)],
+                    cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8", errors="replace")
+                for line in (pub.stdout or "").splitlines():
+                    if any(k in line for k in ("仓库", "发布线", "版本", "APK", "Release", "推送", "上传", "OK", "完成")):
+                        print("  " + line)
+                if pub.returncode != 0:
+                    print("  !! GitHub 发布失败（GitHub 渠道可能仍是旧版）：")
+                    for line in ((pub.stdout or "") + (pub.stderr or "")).splitlines()[-10:]:
+                        print("     " + line)
+        else:
+            print("\n跳过 GitHub 发布：构建时没有设 HPLAY_GH_REPO（或仍是 OWNER/REPO 占位）")
 
     print("\n================ build summary ================")
     for n, dt in TIMINGS:
