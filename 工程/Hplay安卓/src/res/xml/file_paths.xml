@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  第 46 轮「外部播放器」用。
+
+  为什么必须有 FileProvider：Android 7.0 起把 file:// 交给别的应用会抛
+  FileUriExposedException（StrictMode 的 FileUriExposure 检查），
+  所以「外部播放器」这条路在安卓上**只能**走 content://。
+
+  root-path path="/" 是有意的：保存目录是用户自选的（应用私有目录 / 应用外部目录 /
+  系统下载目录 / 手填任意绝对路径），没有任何一组预置 path 能覆盖它。
+  安全性由三件事保证：provider android:exported="false"（别的应用无法直接查询）、
+  android:grantUriPermissions="true"（只对**我们显式发出的那一个 URI**授予临时读权限）、
+  以及我们不把 URI 交给任何不可信组件。
+-->
+<paths>
+    <root-path name="hplay_root" path="/" />
+</paths>
