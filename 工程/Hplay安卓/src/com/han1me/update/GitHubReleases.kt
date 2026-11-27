@@ -43,9 +43,22 @@ object GitHubReleases {
      * 与 [UpdateChecker] 里那两条通道的处理保持一致：彻底直连。
      */
     private val http: OkHttpClient by lazy {
+        // ★ 第 351 轮：与 [UpdateChecker] 同口径 —— 只有 GitHub 一族走内置节点选路。
+        // 实测元数据接口两边一样快（0.36 vs 0.38s），但下载差 6 倍以上，
+        // 两条通道用同一个判据才不会出现「检查走了节点、下载没走」的错位。
         OkHttpClient.Builder()
             .addInterceptor(com.han1me.log.LoggingInterceptor)
-            .proxy(java.net.Proxy.NO_PROXY)
+            .proxySelector(object : java.net.ProxySelector() {
+                override fun select(uri: java.net.URI): List<java.net.Proxy> {
+                    val h = uri.host.orEmpty().lowercase()
+                    val gitHub = h == "github.com" || h.endsWith(".github.com") ||
+                        h.endsWith(".githubusercontent.com")
+                    if (!gitHub) return listOf(java.net.Proxy.NO_PROXY)
+                    return com.han1me.lab.GlobalProxy.selector().select(uri)
+                }
+
+                override fun connectFailed(uri: java.net.URI, sa: java.net.SocketAddress, ioe: java.io.IOException) {}
+            })
             .connectTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
             .build()

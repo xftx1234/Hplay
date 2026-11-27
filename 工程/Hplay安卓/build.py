@@ -391,6 +391,32 @@ def upstream():
         sys.stdout.write(_r348.stderr or "")
         raise SystemExit("[第348轮规则未通过] 构建已中止")
 
+    # ★ 第 350 轮：**转场回 Viewer / 搜索页重构 / 下载页搬出 Column**（规则在 tools/round350.py）。
+    #
+    # 放在 round348 之后：本轮要改的 doSearch / SearchRow / 下载页块，都是 round348
+    # （以及 uifinetune）稳定之后才定形的。
+    _r350 = subprocess.run([sys.executable, str(ROOT / "tools" / "round350.py")],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+    for line in (_r350.stdout or "").splitlines():
+        if line.strip():
+            print(line)
+    if _r350.returncode != 0:
+        sys.stdout.write(_r350.stderr or "")
+        raise SystemExit("[第350轮规则未通过] 构建已中止")
+
+    # ★ 第 351 轮：**javchu 直链预检 Referer / 首页搜索框 MD3 / 半透明统一**（规则在 tools/round351.py）。
+    #
+    # 与 round350 同一位置（它之后、logwire 之前）：本轮要改的 srcOk 调用点与
+    # 首页 TopNavBar 里的搜索胶囊，都是 round350 定形之后才稳定的。
+    _r351 = subprocess.run([sys.executable, str(ROOT / "tools" / "round351.py")],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+    for line in (_r351.stdout or "").splitlines():
+        if line.strip():
+            print(line)
+    if _r351.returncode != 0:
+        sys.stdout.write(_r351.stderr or "")
+        raise SystemExit("[第351轮规则未通过] 构建已中止")
+
     # ★★★ 第 334 轮：**日志拦截器接线**（gen + src 两处都要）。
     #
     # 全项目 14 个 OkHttpClient.Builder（gen 8 + src 6），逐个手改不可维护。

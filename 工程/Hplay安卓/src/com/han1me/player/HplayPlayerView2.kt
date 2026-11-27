@@ -391,14 +391,20 @@ fun HplayPlayerView2(
 
         // ---------- 缓冲指示 ----------
         if (state.state == HplayPlayerState.BUFFERING || state.state == HplayPlayerState.PREPARING) {
+            // ★★ 第 351 轮（用户要求「播放界面的加载图标不要有外面一圈阴影」）：
+            //
+            // 这里原来是一个 42dp 的**黑色半透明圆**（Color.Black alpha 0.5）+ CircleShape，
+            // 图标画在圆里面 —— 用户看到的就是「加载图标外面有一圈阴影」。
+            // 现在删掉那层圆：图标本身已经是圆角图片（HplayLoadMark 自带 clip），
+            // 再套一个黑圆既多余又挡住了画面。
+            //
+            // 也不再加 shadowElevation / graphicsLayer shadow —— 播放区是纯画面，
+            // 任何投影都会在深色场景边缘显出一圈脏影。
             Box(
-                Modifier.align(Alignment.Center).size(42.dp)
-                    .clip(androidx.compose.foundation.shape.CircleShape)
-                    .background(Color.Black.copy(alpha = 0.5f)),
+                Modifier.align(Alignment.Center),
                 contentAlignment = Alignment.Center,
             ) {
-                // ★ 第 349 轮：缓冲指示也换成跳动图标（用户要求「所有页面的加载图标」）
-                com.han1me.ui.HplayLoadMark(markSize = 26.dp)
+                com.han1me.ui.HplayLoadMark(markSize = 30.dp)
             }
         }
 

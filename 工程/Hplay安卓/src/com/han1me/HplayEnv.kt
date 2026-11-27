@@ -82,6 +82,14 @@ object HplayEnv {
     private const val COVER_FILE = "user_cover.jpg"
     private const val AVATAR_FILE = "user_avatar.jpg"
 
+    /**
+     * ★ 第 350 轮：**第三个槽** —— 账户页「换头像」用的临时图。
+     *
+     * 不给它单独一份文件名的话，account 页挑的图会落到 COVER_FILE（用户页封面）上，
+     * 把用户精心设的封面覆盖掉 —— 这是真机一测就能看出来的坑。
+     */
+    private const val ACCOUNT_FILE = "account_avatar_src.jpg"
+
     private var imagePicker: ActivityResultLauncher<String>? = null
     private var pendingPick: ((String?) -> Unit)? = null
     private var pendingKey = "user.cover.file"
@@ -101,7 +109,13 @@ object HplayEnv {
         ) { uri ->
             val cb = pendingPick
             pendingPick = null
-            cb?.invoke(savePicked(uri, if (pendingKey == "user.avatar.file") AVATAR_FILE else COVER_FILE))
+            val target = when (pendingKey) {
+                "user.avatar.file" -> AVATAR_FILE
+                // ★ 第 350 轮：账户页头像单独一份，不覆盖用户页封面
+                "account.avatar.src" -> ACCOUNT_FILE
+                else -> COVER_FILE
+            }
+            cb?.invoke(savePicked(uri, target))
         }
         HplaySlots.pickSupported = true
         // 「信息」页那句版本不许再抄一份常量：包里的版本是构建时从 version.properties 注入 aapt2 的，

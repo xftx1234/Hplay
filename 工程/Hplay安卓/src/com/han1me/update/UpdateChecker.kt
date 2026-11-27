@@ -171,12 +171,33 @@ object UpdateChecker {
     }.getOrDefault("")
 
     private val http: OkHttpClient by lazy {
-        // 第 223 轮（用户指出）：检查更新走内置节点很慢 —— 网盘通道是直连最快的。
-        // 不能复用 HanimeClient.http：它带 LABGLOBAL 每请求拦截器（全局挂节点），
-        // builder 级 NO_PROXY 会被拦截器覆盖。这里用独立裸客户端，彻底直连。
+        // ★★★ 第 351 轮：**检查更新的选路也改了**（用户要求「看下走直连还是代理最快，哪个快走哪个」）。
+        //
+        // 实测（2026-11-27，15 秒窗口，本机同一出口）：
+        //   api.github.com 直连 0.37~0.70s（三次中位数 0.38s）
+        //   api.github.com 经节点 0.33~0.37s（中位数 0.36s）
+        // ⇒ **元数据接口两边几乎没差**，所以「检查」这一步走哪条都行；
+        //   真正差的是**下载**（见 UpdateService：直连 0.00 / 节点 0.60 / 节点+ghfast 0.82 MB/s）。
+        //
+        // 这里**只放行 GitHub 自己的域**到节点的选路，别的渠道（网盘 / CI）保持直连 ——
+        // 网盘通道（openlist / 123pan）是纯国内服务，经节点只会更慢。
+        // GlobalProxy 未启用时 selector 返回 NO_PROXY，行为与旧版完全一致。
         OkHttpClient.Builder()
             .addInterceptor(com.han1me.log.LoggingInterceptor)
-            .proxy(java.net.Proxy.NO_PROXY)
+            .proxySelector(object : java.net.ProxySelector() {
+                override fun select(uri: java.net.URI): List<java.net.Proxy> {
+                    val h = uri.host.orEmpty().lowercase()
+                    // 只有 GitHub 一族走内置节点的选路；其余（网盘/CDN）一律直连
+                    val gitHub = h == "github.com" || h.endsWith(".github.com") ||
+                        h.endsWith(".githubusercontent.com")
+                    if (!gitHub) return listOf(java.net.Proxy.NO_PROXY)
+                    return com.han1me.lab.GlobalProxy.selector().select(uri)
+                }
+
+                override fun connectFailed(uri: java.net.URI, sa: java.net.SocketAddress, ioe: java.io.IOException) {}
+            })
+            .connectTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
             .build()
     }
 

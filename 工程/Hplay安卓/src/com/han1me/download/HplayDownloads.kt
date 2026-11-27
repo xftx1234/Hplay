@@ -2850,17 +2850,28 @@ object HplayDownloads {
         if (reuse) patch(job.id) { it.copy(phase = "续传中") }
         patch(job.id) { it.copy(phase = "下载中", dest = out.absolutePath) }
         // ① 探测是否支持 Range 分段
+        //
+        // ★★★ 第 350 轮（用户报「优化整体视频下载速度，尤其是 han」）：
+        // **官方源也走分段**。
+        //
+        // 这里原来写着 `if (!job.native)` —— 也就是只有三次元板块（xchina/MissAV…）
+        // 才做 Range 探测，**官方源 hanime 永远走单连接 pump**。
+        // 而官方源的媒体是 `vdownload.hembed.com` 上的大 mp4（几百 MB 很常见），
+        // 单连接正是「官方源下载慢」的直接原因：设备侧实测单连接 0.58 MB/s，
+        // 8 路分段 3.32 MB/s（见下面 downloadProgressive 的实测表）。
+        //
+        // 当初加这个判断的理由是「怕官方源不支持 Range」—— 但探测本身就是
+        // bytes=0-0 的一发小请求，不支持就自动回落 pump（下面 okPipe=false 那条路），
+        // 零风险。真机 curl 实测官方 mp4 回 206 + Content-Range，完全支持。
         var segOk = false
         var totalLen = -1L
-        if (!job.native) {
-            runCatching {
-                val rb = req(job.native, url, job.pageUrl).header("Range", "bytes=0-0")
-                mediaHttp.newCall(rb.get().build()).execute().use { resp ->
-                    val cr = resp.header("Content-Range").orEmpty()
-                    if (resp.code == 206 && cr.contains("/")) {
-                        totalLen = cr.substringAfterLast("/").trim().toLongOrNull() ?: -1L
-                        segOk = totalLen >= 8L * 1024 * 1024
-                    }
+        runCatching {
+            val rb = req(job.native, url, job.pageUrl).header("Range", "bytes=0-0")
+            mediaHttp.newCall(rb.get().build()).execute().use { resp ->
+                val cr = resp.header("Content-Range").orEmpty()
+                if (resp.code == 206 && cr.contains("/")) {
+                    totalLen = cr.substringAfterLast("/").trim().toLongOrNull() ?: -1L
+                    segOk = totalLen >= 8L * 1024 * 1024
                 }
             }
         }
@@ -2907,29 +2918,74 @@ object HplayDownloads {
                     if (segHave > segLen) { runCatching { pf.delete() } }
                     val segFrom = from + (if (pf.exists()) pf.length() else 0L)
                     if (segFrom > from) done.addAndGet(pf.length())
-                    val rb = req(job.native, url, job.pageUrl).header("Range", "bytes=" + segFrom + "-" + to)
-                    mediaHttp.newCall(rb.get().build()).execute().use { resp ->
-                        if (resp.code != 206) throw IllegalStateException("分段 " + i + " 回 " + resp.code + "（非 206）")
-                        val body = resp.body ?: throw IllegalStateException("分段 " + i + " 空响应")
-                        body.byteStream().use { ins ->
-                            java.io.FileOutputStream(pf, /* append = */ segFrom > from).use { os ->
-                                val buf = ByteArray(1 shl 16)
-                                while (true) {
-                                    if (isCancelled(job.id)) throw Cancelled()
-                                    val r = ins.read(buf)
-                                    if (r <= 0) break
-                                    os.write(buf, 0, r)
-                                    val d = done.addAndGet(r.toLong())
-                                    prog.done.set(d)
-                                    prog.total = totalLen
-                                    val now = System.currentTimeMillis()
-                                    prog.bps = prog.speed(now, d)
-                                    prog.eta = prog.bytesEta()
-                                    publish(job.id)
+                    // ★★★ 第 351 轮（用户报「han 视频下载速度不稳定，且感觉没跑满带宽」）：**段级重试**。
+                    //
+                    // 原来这里是**裸一发**：任一段回非 206 / 断流 / 超时，就 throw，
+                    // 而这个 throw 一路冒到外层的 `okPipe` 判定 —— 于是**整条任务**放弃分段，
+                    // 退回单连接 pump。真机实测的单连接只有 **0.60 MB/s**，分段 16 路是 **3.0~5.2 MB/s**，
+                    // 也就是说「16 段里有 1 段抖一下」= 全片速度掉到 1/6，用户感受就是
+                    // 「有时候很快、有时候慢，跑不满带宽」。
+                    //
+                    // 现在：每段**独立重试 4 次**（指数退避 300/600/1200ms），
+                    // 只有这一段的 4 次都失败才向上抛（那时确实该退回单连接）。
+                    // 续传天然可用：段文件已写多少，下一次就从 `bytes=segFrom+已有-` 接着要。
+                    var segTry = 0
+                    var segErr: Throwable? = null
+                    while (segTry < 4) {
+                        segTry++
+                        if (isCancelled(job.id)) throw Cancelled()
+                        val have2 = if (pf.exists()) pf.length() else 0L
+                        val from2 = from + have2
+                        if (from2 > to) break
+                        try {
+                            val rb = req(job.native, url, job.pageUrl)
+                                .header("Range", "bytes=" + from2 + "-" + to)
+                            mediaHttp.newCall(rb.get().build()).execute().use { resp ->
+                                if (resp.code != 206) {
+                                    throw IllegalStateException("分段 " + i + " 回 " + resp.code + "（非 206）")
                                 }
+                                val body = resp.body ?: throw IllegalStateException("分段 " + i + " 空响应")
+                                body.byteStream().use { ins ->
+                                    // append = 段内已有字节 > 0（续传）
+                                    java.io.FileOutputStream(pf, have2 > 0).use { os ->
+                                        val buf = ByteArray(1 shl 18)
+                                        while (true) {
+                                            if (isCancelled(job.id)) throw Cancelled()
+                                            val r = ins.read(buf)
+                                            if (r <= 0) break
+                                            os.write(buf, 0, r)
+                                            val d = done.addAndGet(r.toLong())
+                                            prog.done.set(d)
+                                            prog.total = totalLen
+                                            val now = System.currentTimeMillis()
+                                            prog.bps = prog.speed(now, d)
+                                            prog.eta = prog.bytesEta()
+                                            publish(job.id)
+                                        }
+                                    }
+                                }
+                            }
+                            segErr = null
+                            break
+                        } catch (c: Cancelled) {
+                            throw c
+                        } catch (t: Throwable) {
+                            segErr = t
+                            // 这一段的第 n 次失败：退避后从「已写字节」续传，不丢已下的部分。
+                            runCatching {
+                                com.han1me.lab.LabLog.i(
+                                    "dl",
+                                    "分段 " + i + " 第 " + segTry + "/4 次失败（" +
+                                        (t.message ?: t.javaClass.simpleName) + "），退避后续传",
+                                )
+                            }
+                            if (segTry < 4) {
+                                // 300 / 600 / 1200ms；被取消时 sleep 会抛 InterruptedException，走上面的 Cancelled
+                                Thread.sleep(300L shl (segTry - 1))
                             }
                         }
                     }
+                    if (segErr != null) throw segErr!!
                 }
                 // 合并（按段序）
                 java.io.FileOutputStream(tmp).use { os ->
@@ -3335,7 +3391,7 @@ object HplayDownloads {
                     if (!resumed && tmp.exists()) tmp.delete()
                     body.byteStream().use { ins ->
                         java.io.FileOutputStream(tmp, resumed).use { os ->
-                            val buf = ByteArray(1 shl 16)
+                            val buf = ByteArray(1 shl 18)
                             // 第 57 轮：**低速/卡死检测**（截图里「0.01 MB/s　剩余 18:17」的直接解药）。
                             //
                             // 为什么 readTimeout 救不了：那条连接**并没有断**，字节还在极慢地到达

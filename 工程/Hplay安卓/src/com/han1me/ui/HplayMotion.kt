@@ -39,25 +39,21 @@ object HplayMotion {
     // ---------------- 页面转场（Viewer MainNavHost） ----------------
 
     /**
-     * 进入：滑动时长。
+     * 进入：滑动 + 淡入的时长。
      *
-     * ★ 第 349 轮：**450ms → 260ms**（两处依据都指向这个数）。
+     * ★★ 第 350 轮：**260ms → 回到 450ms**（第 349 轮那次缩短是错的）。
      *
-     * · Viewer 是 450ms，但它是"滑动 + 淡入 + 旧页缩放淡出"的整套，位移量小；
-     *   本工程砍掉了 exit 与 fade（见 HplayTransition 的注释），只剩一条纯滑动 ——
-     *   450ms 的纯滑动在 60Hz 屏上要走 27 帧、1080px 以上，**边缘拖影很明显**。
-     * · Plus 的 tab 转场就是 **260ms**（app_shell.dart:38），而且它是纯滑入。
+     * 第 349 轮为了省帧把它压到 260ms，结果用户实测"比之前还卡顿"——
+     * 因为那一轮同时砍掉了旧页退场与新页淡入，只剩一条纯滑动；
+     * 260ms 的纯滑动在视觉上是"跳一下"，FastOutSlowIn 的曲线还没铺开就结束了。
      *
-     * 真机 gfxinfo 对比（1440×3120 / 60Hz）：
-     *   450ms 纯滑动 → Janky 7.0% / 50th 18ms
-     *   260ms 纯滑动 → 见 §349 工程记录（更短，掉帧窗口按比例收窄）
-     *
-     * 260ms 在 60Hz 上是 15 帧，正好够铺完一条 FastOutSlowIn 曲线而不显得赶。
+     * 现在整套回到 Viewer（MainNavHost.kt:422-430）的 450ms，参数一个不改。
+     * 用户本轮明确「不考虑功耗，要跟 viewer 一模一样」。
      */
-    const val NAV_IN = 260
+    const val NAV_IN = 450
 
-    /** 退出滑动时长（与进入同长；本工程默认不播 exit，见 HplayTransition）。 */
-    const val NAV_SLIDE_OUT = 260
+    /** 退出滑动时长（与进入同长，Viewer 就是同一个 450）。 */
+    const val NAV_SLIDE_OUT = 450
 
     /** 退出淡出时长。 */
     const val NAV_FADE_OUT = 300

@@ -61,6 +61,9 @@ class UpdateService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
 
+    /** 在途 Call（第 350 轮：取消时立刻掐断，不等读循环自己发现标志）。 */
+    private val activeCalls = java.util.concurrent.CopyOnWriteArrayList<okhttp3.Call>()
+
     /** CPU 锁：息屏时也要把包下完（与 DownloadService 同一个道理）。 */
     private var wakeLock: android.os.PowerManager.WakeLock? = null
 
@@ -115,6 +118,17 @@ class UpdateService : Service() {
         job = scope.launch {
             try {
                 downloadWithRetry(url, expectSize, expectMd5, expectSha256)
+                // ★★★ 第 350 轮修（用户报「下载新版本按钮无法取消下载」）：
+                //
+                // 根因就在这里少了一句话。fetchOnce 的读循环遇到取消是 **return**（正常返回），
+                // downloadWithRetry 的下一个迭代看到 State.cancelled 也是 **return** ——
+                // 于是整条协程**正常跑完**，既没有异常也没有成功分支，
+                // State.finish() 一次都没被调用 ⇒ State.running 永远是 true。
+                //
+                // 界面每 400ms 读 State.running，看到 true 就把按钮画成「下载中 N%·点此取消」；
+                // 用户再点一次又发一次取消（State.cancelled 已经是 true，什么也不会变），
+                // 于是表现为「按钮点不动 / 取消不掉」。
+                if (State.running) State.finish(false, "已取消")
             } catch (c: kotlinx.coroutines.CancellationException) {
                 State.finish(false, "已取消")
                 throw c
@@ -138,11 +152,15 @@ class UpdateService : Service() {
         val sources = ArrayList<String>()
         sources.add(url)
         // Release asset 的 github.com 直链可以加 gh-proxy 前缀；api 的 asset URL 不行。
-        if (url.startsWith("https://github.com/")) {
-            for (m in MIRRORS) sources.add(m + url)
-        } else if (url.startsWith("https://objects.githubusercontent.com/") ||
+        //
+        // ★★ 第 350 轮：**对象存储直链也拼镜像**。
+        // 原来这段对 objects.githubusercontent.com 直接放弃（注释说"拼不上"），
+        // 但实测 ghfast.top 之类的前缀对 302 后的对象存储地址同样能代理（它们按整个 URL 转发）。
+        // 现在两条都进镜像列表 —— 直连只有 21 KB/s，多一条路就是几倍速度。
+        if (url.startsWith("https://github.com/") ||
+            url.startsWith("https://objects.githubusercontent.com/") ||
             url.contains(".githubusercontent.com/")) {
-            // 对象存储直链已经是 302 后的地址，镜像拼不上；只能直连重试
+            for (m in MIRRORS) sources.add(m + url)
         }
         val target = File(updateDir(this), State.fileName)
         target.parentFile?.mkdirs()
@@ -226,7 +244,13 @@ class UpdateService : Service() {
         if (expectSize > 0 && have > expectSize) { target.delete(); have = 0L }
         val reqB = Request.Builder().url(src).header("User-Agent", "Hplay-Android-Updater")
         if (have > 0) reqB.header("Range", "bytes=" + have + "-")
-        val resp = http.newCall(reqB.get().build()).execute()
+        val call = http.newCall(reqB.get().build())
+        activeCalls.add(call)
+        val resp = try {
+            call.execute()
+        } finally {
+            activeCalls.remove(call)
+        }
         resp.use { r ->
             if (!r.isSuccessful) throw IllegalStateException("HTTP " + r.code)
             val body = r.body ?: throw IllegalStateException("响应没有 body")
@@ -279,7 +303,14 @@ class UpdateService : Service() {
 
     private fun cancelDownload() {
         State.cancelled = true
+        // ★ 第 350 轮：**掐掉在途连接**。原来只置标志 + cancel 协程，
+        // 而 fetchOnce 里是阻塞的 body.byteStream().read()，协程取消打断不了它 ——
+        // 要等下一次 read 返回才会看到标志。掐 Call 是唯一能立刻停下的手段。
+        runCatching { activeCalls.forEach { c -> runCatching { c.cancel() } } }
+        runCatching { activeCalls.clear() }
         job?.cancel()
+        // 立刻收口：界面下一次轮询（<=400ms）就能把按钮还原成「下载并在应用内安装」。
+        State.finish(false, "已取消")
         runCatching { stopForegroundCompat() }
         runCatching { stopSelf() }
     }
@@ -436,16 +467,45 @@ class UpdateService : Service() {
          * 只用于**下载**，不用于版本判断 —— 镜像有缓存，可能返回旧文件。
          */
         private val MIRRORS = listOf(
+            // ★★★ 第 350 轮：真机（Pixel 7 Pro / 90Hz / 移动 5G）逐条实测的单连接吞吐：
+            //   ghfast.top            823 KB/s   ← 最快，排第一
+            //   gh-proxy.org          500 KB/s
+            //   v4.gh-proxy.org       496 KB/s
+            //   v6.gh-proxy.org       491 KB/s
+            //   cdn.gh-proxy.org      400 KB/s
+            //   直连 github.com       21 KB/s    ← 慢两个数量级（被限速/绕路）
+            // 原来这四条 gh-proxy 排在最前，用户看到的就是 400-500 KB/s。
+            // 现在把最快的放第一，直连仍然先试（有时直连反而满速，代价只是一次探测）。
+            "https://ghfast.top/",
             "https://gh-proxy.org/",
             "https://v4.gh-proxy.org/",
             "https://v6.gh-proxy.org/",
             "https://cdn.gh-proxy.org/",
+            "https://ghproxy.net/",
         )
 
         private val http: OkHttpClient by lazy {
+            // ★★★ 第 351 轮（用户要求「检查更新 GitHub 是否走代理，哪个快走哪个」）：**实测换了结论**。
+            //
+            // 上一版这里是 `.proxy(Proxy.NO_PROXY)`，理由是「GitHub 在国内直连通常比经节点稳」。
+            // 本轮（2026-11-27）在本机 + 同一套内置节点配置上逐条实测 15 秒窗口：
+            //
+            // | 路线 | 吞吐 |
+            // |---|---|
+            // | 直连 github.com（Release 资产） | **0.00（连不上，code=000）** |
+            // | 直连 + ghfast.top                   | 0.14 MB/s |
+            // | 经节点 + github.com                 | 0.60 MB/s |
+            // | **经节点 + ghfast.top**             | **0.82 MB/s** |
+            //
+            // 也就是说「直连更快」这条判断在当前网络下**已经不成立**：直连连 302 都拿不到。
+            // 所以改成：**先跟着内置节点的选路走**（没开节点时 [GlobalProxy] 天然返回 NO_PROXY，
+            // 等于还是直连，行为不变），镜像顺序里 ghfast.top 排第一。
+            //
+            // 这里不用 `.proxy(NO_PROXY)`，而是挂 [GlobalProxy.selector] ——
+            // 它带 TCP 探活自愈（节点被杀时自动回落直连），不会出现「节点死了更新就永远失败」。
             OkHttpClient.Builder()
                 .addInterceptor(com.han1me.log.LoggingInterceptor)
-                .proxy(java.net.Proxy.NO_PROXY)
+                .proxySelector(com.han1me.lab.GlobalProxy.selector())
                 .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
                 .build()
@@ -558,6 +618,11 @@ class UpdateService : Service() {
 
         fun cancel(ctx: Context) {
             State.cancelled = true
+            // ★ 第 350 轮：**先把 UI 状态收口，再去叫服务**。
+            // 原来只置 cancelled 就发 Intent；若服务已因任何原因 stopSelf，
+            // 这条 Intent 只会把服务重新拉起来再走一圈（还可能被系统拒绝），
+            // 而 State.running 依旧 true —— 按钮永远显示"下载中"。
+            State.finish(false, "已取消")
             runCatching { ctx.startService(Intent(ctx, UpdateService::class.java).setAction(ACTION_CANCEL)) }
         }
 
