@@ -445,6 +445,15 @@ fun HplayWebView(
     navigator: HplayWebNavigator,
     modifier: Modifier = Modifier,
 ) {
+    // ★★★ 第 346 轮修（结构性 bug）：**AndroidView 必须按 state 加 key**。
+    //
+    // AndroidView 的 factory 只在**首次组合**时跑一次，之后靠 update 同步。
+    // 而本组件唯一的调用点（Han1meWeb.kt）是在同一个 Compose 位置反复渲染不同网页，
+    // 不换 key 就是同一个 WebView 实例被复用 —— 上一页的 DOM、滚动位置、
+    // 注入过的广告过滤脚本全部留着。用户看到的就是「开第二个网页，显示的还是第一页」。
+    //
+    // 加 key 之后，state 变了就是新实例，旧实例被 AndroidView 正常回收。
+    androidx.compose.runtime.key(state) {
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
@@ -614,4 +623,5 @@ fun HplayWebView(
             if (state.webView === wv) state.webView = null
         },
     )
+    }
 }

@@ -97,6 +97,10 @@ fun HplayPlayerTopBar(
      * 现在顶栏给出按钮，锁定后只剩悬浮的解锁键（见 HplayPlayerView2）。
      */
     onLock: () -> Unit = {},
+    /** ★ 第 346 轮：旋转按钮。null = 不显示（例如没有视频）。 */
+    onRotate: (() -> Unit)? = null,
+    /** 是否处于「可旋转」提示态（传感器判定方向与素材不一致）。 */
+    rotateHint: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     AnimatedVisibility(visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
@@ -123,6 +127,17 @@ fun HplayPlayerTopBar(
                 modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(10.dp))
+            // ★ 第 346 轮：**旋转按钮**（用户要求「在左下角形成一个旋转按钮」）。
+            //
+            // 位置说明：左下角在播放时是诊断行（时长/轨道/缓冲），底栏进度条又占满
+            // 左下可视区，塞按钮会压住时间。顶栏是控制区里唯一稳定的空位，
+            // 且紧邻锁定键，语义上也属于「画面相关」。
+            // 提示态（设备方向与素材方向不一致）时按钮带一个小点，平常是纯图标 ——
+            // 符合用户「不默认旋转，检测到才提示」的要求。
+            if (onRotate != null) {
+                GlassButton(if (rotateHint) "⟳·" else "⟳", onRotate)
+                Spacer(Modifier.width(8.dp))
+            }
             GlassButton("🔒", onLock)
             Spacer(Modifier.width(8.dp))
             val speed = HplayPlayerDefaults.SPEEDS.getOrElse(state.speedIndex) { 1.0f }

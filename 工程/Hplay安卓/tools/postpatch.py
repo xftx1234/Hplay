@@ -2060,6 +2060,30 @@ def patch_jav_src_probe(text):
     return text
 
 
+def patch_build_info_version(text):
+    """给 HplayBuildInfo 加 versionName() 访问器（第 346 轮）。
+
+    HplayBuildInfo 是 internal object，设置页要读版本号 ——
+    加一个公开函数比把整个 object 改成 public 影响面小（后者会让
+    GH_REPO / GH_LINE 也一起暴露给全模块）。
+    """
+    if "versionName()" in text:
+        return text
+    anchor = "    const val BUILD_SHA: String"
+    i = text.find(anchor)
+    if i < 0:
+        return text
+    j = text.find(chr(10), i)
+    if j < 0:
+        return text
+    ins = NL.join([
+        "",
+        "    // " + chr(0x2605) + " 第 346 轮：设置页「关于」要读版本号。",
+        "    fun versionName(): String = VERSION_NAME",
+    ])
+    return text[:j+1] + ins + chr(10) + text[j+1:]
+
+
 def patch_last_watch_url(text):
     """记录最近一次抓取的详情页地址（第 345 轮）。
 
@@ -2160,6 +2184,10 @@ def patch_subscribe_origin(text):
         '            // 而 CF 的这条规则也会看 Referer 与提交路径的一致性。',
         '            .header("Referer", com.javrocket.hanime.HanimeClient.lastWatchUrl.ifBlank { "$BASE/" })',
         '            .header("Origin", BASE)',
+        '            // ★ 第 345 轮：**UA 用桌面形态**（主线版实证可过）。',
+        '            // 实验版全局 UA 是 Android 移动版（CfUa.USER_AGENT），与 WebView 过盾保持一致；',
+        '            // 但 CF 对移动 UA 的 POST 似乎更敏感。主线版用桌面 Chrome UA，关注一直是好的。',
+        '            .header("User-Agent", com.han1me.lab.CfUa.DESKTOP_USER_AGENT)',
         '            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")',
         '            .header("Accept-Language", "zh-TW,zh;q=0.9,en;q=0.8")',
         '            .header("X-CSRF-TOKEN", token)',
@@ -2801,6 +2829,8 @@ def apply_rules(text, out_name, strict=True):
         text = patch_testline_log(text)
         text = patch_mirror_sources(text)
         text = patch_mirror_dedup(text)
+    if out_name == "HplayBuildInfo.kt":
+        text = patch_build_info_version(text)
     if out_name == "HanimeClient.kt":
         text = patch_artist_avatar(text)
         text = patch_title_unescape(text)

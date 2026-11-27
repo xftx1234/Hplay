@@ -115,6 +115,8 @@ object HplayOrientation {
         val same = autoPortrait == portraitVideo
         autoPortrait = portraitVideo
         if (owner != null) return
+        // ★ 第 346 轮：用户手动旋转过就**不再跟随素材**（否则按钮一点就被覆盖）
+        if (userPortrait != null) return
         val act = activityOf(ctx) ?: return
         val want = if (portraitVideo) {
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
@@ -135,6 +137,7 @@ object HplayOrientation {
     /** 离开播放器：撤销自动朝向，交还系统。 */
     fun releaseAuto(ctx: Context, reason: String = "auto-off") {
         autoPortrait = null
+        userPortrait = null
         autoGen++
         if (owner != null) return
         release(ctx, reason)
@@ -195,6 +198,32 @@ object HplayOrientation {
             com.han1me.lab.LabLog.i("player.orient", "方向已交还系统（" + reason + "）")
         }
     }
+
+    /**
+     * ★★ 第 346 轮（用户要求）：**手动旋转到指定方向**。
+     *
+     * 与 [setAuto] 的区别：setAuto 是「跟随素材天然朝向」，本方法是「用户说了算」。
+     * 用户点了旋转按钮之后，屏幕方向**不再跟随素材**，也不再被自动朝向覆盖 ——
+     * 所以这里把 [userPortrait] 记下来，[setAuto] 会尊重它。
+     *
+     * @param portrait true = 转成竖屏，false = 转成横屏
+     */
+    fun rotateTo(ctx: Context, portrait: Boolean) {
+        val act = activityOf(ctx) ?: return
+        userPortrait = portrait
+        owner = null
+        autoGen++
+        act.requestedOrientation = if (portrait) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+        com.han1me.lab.LabLog.i("player.orient", "手动旋转 " + (if (portrait) "竖屏" else "横屏"))
+    }
+
+    /** 用户手动旋转过的方向；null = 未手动干预，仍跟随素材。 */
+    @Volatile
+    private var userPortrait: Boolean? = null
 
     /** 切换。 */
     fun toggle(ctx: Context, portraitVideo: Boolean, currentlyFullscreen: Boolean) {

@@ -196,19 +196,31 @@ fun HplaySettingsHost(
                     onCheckUpdate = { com.han1me.ui.HplayUpdateState.request() },
                 )
             }
-            if (false) { item { AboutSettingsContent() }
+            // ★ 第 346 轮修（结构错误）：这里原本是
+            //     if (false) { item { AboutSettingsContent() }
+            //     item { ...版本信息... }
+            // 少了一个右花括号 —— 于是「if (false)」把**下面整块版本信息**也吃进去了，
+            // 大括号一路套到文件末尾（末尾那三行裸 `}` 就是欠账）。
+            // 后果：设置页最下面的「版本」分区**从来不显示**，而编译器只会说大括号配平
+            // （凑巧配上了），不会报错。
+            // 现在：把死分支显式注释掉，版本信息正常渲染。
+            // 删掉的只是一行 if：AboutSettingsContent 已被 AboutPageViewerStyle 取代。
             item {
                 HplaySectionGroup("版本") {
                     Column(Modifier.padding(14.dp)) {
                         Text(
-                            "Hplay 实验版 · v1.1.69-refactor",
+                            // ★ 第 346 轮：**版本号从构建注入读**，不再硬编码。
+                            // 原来写死 "v1.1.69-refactor"，从 1.1.69 一路显示到 1.1.79 都没变过。
+                            "Hplay 实验版 · v" + runCatching {
+                                com.han1me.update.HplayBuildInfo.versionName()
+                            }.getOrDefault("?"),
                             color = MaterialTheme.colorScheme.onSurface,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
                         )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "基于上游 v1.1.69 重构。UI 参照 Han1meViewer 与 Han1mePlus " +
+                            "基于上游 AvPlay 重构。UI 参照 Han1meViewer 与 Han1mePlus " +
                                 "（Material Design 3）。CF 质询由 OkHttp 拦截器 + WebView 验证页处理。",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             fontSize = 11.sp,
@@ -218,7 +230,6 @@ fun HplaySettingsHost(
                 }
             }
         }
-    }
     }
     }
 }

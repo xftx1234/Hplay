@@ -44,7 +44,15 @@ object HplayWebProxy {
             .proxySelector(GlobalProxy.selector())
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
-            .callTimeout(0, TimeUnit.MILLISECONDS)
+            // ★ 第 346 轮修：**callTimeout(0) = 永不超时**。
+            //
+            // 原来写 0 是想要「大文件慢慢下」，但 0 在 OkHttp 里表示**没有整体超时**：
+            // 一条被节点半路掐断的连接会挂到 read 超时（60s）才断，而重定向链/
+            // 慢速滴流（每 59 秒来一个字节）则能无限期挂着。WebView 那边等不到响应，
+            // 页面就一直转圈，且没有任何日志（因为请求根本没结束）。
+            //
+            // 改成 5 分钟：足够覆盖 200MB 级分片下载，又能给死连接一个兜底。
+            .callTimeout(5, TimeUnit.MINUTES)
             .followRedirects(true)
             .build()
     }

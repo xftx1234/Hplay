@@ -157,6 +157,20 @@ fun HplayPlayerView2(
         onDispose { runCatching { com.han1me.player.HplayOrientation.releaseAuto(appCtx) } }
     }
 
+    // ★★★ 第 346 轮（用户要求）：**方向传感器 + 旋转提示**。
+    //
+    // 上一轮把播放朝向锁在素材天然方向，好处是「横版默认横屏」成立，
+    // 代价是用户把手机转过来画面不跟。用户要求「不默认旋转，但检测到方向变化后
+    // 提示可以手动旋转，并给一个旋转按钮」——所以这里只**检测 + 提示**，
+    // 真正转屏由用户点按钮触发（见下面 onRotate）。
+    HplayOrientationSensor.rememberSensor()
+    androidx.compose.runtime.LaunchedEffect(state.videoWidth, state.videoHeight) {
+        if (state.videoWidth > 0 && state.videoHeight > 0) {
+            HplayOrientationSensor.setVideoPortrait(state.isPortraitVideo)
+        }
+    }
+    val rotateHint = HplayOrientationSensor.hintVisible
+
     Box(modifier.background(Color.Black)) {
         // ---------- 视频画面 ----------
         //
@@ -331,6 +345,15 @@ fun HplayPlayerView2(
             // 锁定后控制条一律不画（否则锁定毫无意义 —— 一碰就全出来了）
             visible = controlsVisible && !state.isGestureLocked,
             onLock = { controller.setGestureLocked(true) },
+            // ★ 第 346 轮：旋转按钮。点一下把屏幕转到「另一个方向」——
+            // 相对当前设备握持方向翻转，而不是相对素材，这样用户想怎么看就怎么看。
+            onRotate = {
+                val wantPortrait = !HplayOrientationSensor.devicePortrait
+                com.han1me.player.HplayOrientation.rotateTo(appCtx, wantPortrait)
+                HplayOrientationSensor.clearHint()
+                showControls()
+            },
+            rotateHint = rotateHint,
             onBack = { onBackClick?.invoke() },
             onSpeedClick = {
                 val next = (state.speedIndex + 1) % HplayPlayerDefaults.SPEEDS.size
