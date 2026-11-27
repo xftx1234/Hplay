@@ -209,9 +209,22 @@ class DownloadService : Service() {
         total: Long,
         determinate: Boolean,
     ): Notification {
+        // ★★★ 第 352 轮（用户报「通知栏点击下载中的通知不跳转正在下载页」）：**这里原来只拉起 App**。
+        //
+        // 旧写法是一个**光秃秃的 Intent**：没 extra、没 action。点通知的效果只是
+        // 「把 MainActivity 拉到前台」——如果用户本来就在首页，什么也不会变，
+        // 看起来就是「点了没反应」。要跳到下载页，必须把「要打开哪个页」这件事传给 App。
+        //
+        // 现在：带 EXTRA_OPEN = "downloads"，由 MainActivity.onNewIntent/onCreate 读取
+        // 并写进 HplayNavRequest，Compose 侧收集后打开下载面板（见 HplayNavRequest.kt）。
+        //
+        // requestCode 仍是 0（唯一），FLAG_UPDATE_CURRENT 保证 extra 每次刷新 ——
+        // 否则第二次点通知拿到的还是第一次那份不带 extra 的旧 Intent。
         val open = PendingIntent.getActivity(
             this, 0,
-            Intent(this, com.han1me.MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            Intent(this, com.han1me.MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                .putExtra(com.han1me.HplayNavRequest.EXTRA_OPEN, com.han1me.HplayNavRequest.OPEN_DOWNLOADS),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val stop = PendingIntent.getService(

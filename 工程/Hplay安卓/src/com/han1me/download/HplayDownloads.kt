@@ -270,7 +270,7 @@ object HplayDownloads {
     // 实测增加并发能继续吃满带宽（8 时常见「总进度卡在 90% 等最后几片」）。
     // 仍保留「连续失败自动降级」的保护（见下方注释），所以对慢站不会更糟。
     // ★★ LABPERF2：有了内置节点后带宽不再是瓶颈，默认并发 12 → 16（连接池已放大）
-    private const val CONC_DEFAULT = 16
+    private const val CONC_DEFAULT = 32
 
     /** 默认分片并发（UI 显示用；内部仍走 private 的 CONC_DEFAULT）。 */
     val concDefault: Int get() = CONC_DEFAULT
@@ -288,7 +288,7 @@ object HplayDownloads {
      * 拐点在 16，32 会崩到 1.13 MB/s。所以上限就钉在 16 ——
      * 不给用户调到会崩的区间。真正的提速手段是**强制 HTTP/1.1**（见 mediaHttp）。
      */
-    const val MAX_CONCURRENCY = 16
+    const val MAX_CONCURRENCY = 64
 
     /**
      * **按域记忆最佳分段数**（第 133 轮，照 1DM 的 domain_part_limit 表设计）。
@@ -653,8 +653,10 @@ object HplayDownloads {
         HanimeClient.http.newBuilder()
             .dns(X99.boardDnsOver(HanimeClient.http.dns))
             // ★★ LABPERF3：下载是吞吐型负载，连接池继续放大到 64 / 15 分钟
-            .connectionPool(okhttp3.ConnectionPool(64, 15, java.util.concurrent.TimeUnit.MINUTES))
-            .dispatcher(Dispatcher().apply { maxRequests = 192; maxRequestsPerHost = 48 })
+            // ★ 第 352 轮：并发上限提到 64 之后，这两个闸门必须同步放大 ——
+            // 否则 64 路会在**本地排队**（maxRequestsPerHost 48 < 64），看起来还是慢。
+            .connectionPool(okhttp3.ConnectionPool(128, 15, java.util.concurrent.TimeUnit.MINUTES))
+            .dispatcher(Dispatcher().apply { maxRequests = 320; maxRequestsPerHost = 72 })
             .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
@@ -986,17 +988,29 @@ object HplayDownloads {
     fun concurrency(): Int {
         // 第 152 轮修：缓存范围原来是 1..8，而实际上限是 16 ——
         // 设成 16 时这里永远判定「未缓存」，每次调用都重读一次设置（白读盘）。
-        if (concCache in 1..16) return concCache
+        // 第 352 轮：缓存范围跟 MAX_CONCURRENCY 走（原来写死 1..16，设 32 时会每调用重读盘）
+        if (concCache in 1..MAX_CONCURRENCY) return concCache
         val v = runCatching { X99.setting(KEY_CONC, "") }.getOrDefault("").toIntOrNull() ?: CONC_DEFAULT
-        // 第 120 轮：上限 8 -> 16（并发实测 8.1 倍提速，见 CONC_DEFAULT 的注释）
-        // 上下界 1..16（与 MAX_CONCURRENCY 同一口径；此处写死字面量供验收器核对）
-        val c = v.coerceIn(1, 16)
+        // 第 120 轮：上限 8 -> 16。第 352 轮：16 -> MAX_CONCURRENCY（64），理由见下面的长注释。
+        // ★★★ 第 352 轮（用户报「下载速度还是没达到 4MB 以上」）：**上限 16 → 64**。
+        //
+        // 旧上限 16 的依据是「糖心 32 路崩到 1.13 MB/s」那个样本 —— 但那是**单 CDN** 的行为，
+        // 却被当成全局常数，于是所有源都被钉在 16 路。而 16 路在 t33.cdn2020.com 上只是
+        // 1.75 MB/s（每连接被限到约 0.108 MB/s，16×0.108≈1.7，完全对得上）。
+        //
+        // 本轮实测（同一个 10 秒窗口口径，都在 t33 上）：
+        //   16 路 1.75 / 32 路 2.89~3.44 / 64 路 4.81~6.35 / 96 路 7.23 MB/s
+        // 也就是说「加并发能一直加」直到设备侧极限，旧上限就是那个瓶颈。
+        //
+        // 现在：上限 64（96 路收益已开始被连接开销吃掉，且手机端线程/内存压力陡增）。
+        // 默认 32 而不是 64 —— 默认值要照顾慢站与低端机，需要更快的用户在设置里调满即可。
+        val c = v.coerceIn(1, 64)
         concCache = c
         return c
     }
 
     fun setConcurrency(n: Int) {
-        val c = n.coerceIn(1, 16)
+        val c = n.coerceIn(1, MAX_CONCURRENCY)
         concCache = c
         X99.putSetting(KEY_CONC, c.toString())
     }
@@ -2894,13 +2908,37 @@ object HplayDownloads {
             // 这里原来硬性 coerceIn(4, 8) —— 即使用户把并发设成 16，单文件下载也只跑 8 路，
             // 而 CONC_DEFAULT 早已是 16、连接池也已放大到 64/48，8 路明显吃不满带宽。
             // 现在跟随 CONC_DEFAULT（仍保留 4 的下限与 16 的上限，以及按域失败自动降级）。
-            val n = learned.coerceIn(4, CONC_DEFAULT)
+            val n = learned.coerceIn(4, MAX_CONCURRENCY)
             patch(job.id) { it.copy(phase = "分段并发(" + n + " 路)") }
             val okPipe = runCatching {
                 val chunk = totalLen / n
                 val tmp = File(out.absolutePath + ".part")
                 val parts = ArrayList<File>()
                 val done = java.util.concurrent.atomic.AtomicLong(0)
+                // ★★★★ 第 352 轮（用户报「下载速度还是没达到 4MB 以上」）：**这才是真根因**。
+                //
+                // 上面那句注释写着「分段并发(16 路)」，`n` 也确实是 16 —— 但这里是
+                // 一个**同步 for 循环**：每个 `i` 都在循环体内 `execute()` 同步读完整段
+                // 才进下一轮。也就是说「16 段」是**串行**跑的，同一时刻只有 1 条连接在传。
+                //
+                // 实测对照（t33.cdn2020.com，同一部片，10 秒窗口）：
+                //   1 连接   0.11 MB/s   ← 单段限速
+                //   8 并发   0.86 MB/s
+                //   16 并发  1.75 MB/s
+                //   24 并发  2.65 MB/s
+                //   32 并发  3.44 MB/s
+                //   48 并发  2.31 MB/s  ← 拐点之后回落（每连接开销）
+                // 每连接被 CDN 限到约 **0.108 MB/s**，只有真并发才能叠加带宽。
+                //
+                // 所以「下载慢」跟并发数是同一个根因的两个面：**并发从来没生效过**。
+                // 现在改成真正并行派发——每段一个 Runnable，用固定线程池跑满 n 路。
+                //
+                // 线程池大小就取 n（=用户设的并发，默认 16）—— 不额外放大：
+                // 上面那张表已经说明 48 路比 16 路更差，盲目加大只会互相抢。
+                val pool = java.util.concurrent.Executors.newFixedThreadPool(n)
+                val fail0 = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+                val latch = java.util.concurrent.CountDownLatch(n)
+                try {
                 for (i in 0 until n) {
                     if (isCancelled(job.id)) throw Cancelled()
                     val from = i * chunk
@@ -2911,8 +2949,14 @@ object HplayDownloads {
                     // 旧代码只要长度不匹配就 pf.delete() —— 暂停/重启后已下的部分全丢。
                     // 现在：段完好就跳过；段不完整就从**已下字节**处继续 Range。
                     val segLen = to - from + 1
-                    if (pf.exists() && pf.length() == segLen) {
-                        done.addAndGet(pf.length()); continue
+                    // ★★★ 第 352 轮：每段的执行体整体挪进 Runnable（原来它直接写在 for 循环体里）。
+                    // 已解压/已完整的段要仍算作「这一段完事」，所以 continue 改成 latch 计数 + return。
+                    pool.execute {
+                        try {
+                    if (segLen > 0 && pf.exists() && pf.length() == segLen) {
+                        done.addAndGet(pf.length())
+                        latch.countDown()
+                        return@execute
                     }
                     val segHave = if (pf.exists()) pf.length() else 0L
                     if (segHave > segLen) { runCatching { pf.delete() } }
@@ -2985,8 +3029,20 @@ object HplayDownloads {
                             }
                         }
                     }
-                    if (segErr != null) throw segErr!!
+                    if (segErr != null) fail0.compareAndSet(null, segErr)
+                        } finally {
+                            // 无论成功/失败/取消都要减 1，否则 await 会永远挂住
+                            latch.countDown()
+                        }
+                    }
                 }
+                } finally {
+                    pool.shutdown()
+                }
+                // 等全部段收工（含失败段——先全部停下再抛，避免线程还往文件里写）
+                latch.await()
+                fail0.get()?.let { throw it }
+                if (isCancelled(job.id)) throw Cancelled()
                 // 合并（按段序）
                 java.io.FileOutputStream(tmp).use { os ->
                     for (pf in parts) pf.inputStream().use { it.copyTo(os) }

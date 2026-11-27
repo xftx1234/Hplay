@@ -19,11 +19,38 @@ import com.han1me.update.HplayUpdateChannel
  * 底层能力（节点、备份、下载）都在各自的包里，这里只调用。
  */
 
-/** 网络设置页正文：内置节点 + 说明。 */
+/** 网络设置页正文：javchu 路由 + 内置节点 + 说明。 */
 @Composable
 fun NetworkSettingsContent() {
     val cs = MaterialTheme.colorScheme
+    // ★★ 第 352 轮（用户要求「设置 网络里加一项 javchu 路由开关，可切换走直连还是代理」）：
+    //
+    // 默认 direct。理由是**实测**而不是偏好：t33.cdn2020.com（javchu 的媒体域）
+    // 直连 200 + 完整 m3u8 + 分片全 200；经内置节点（美西）一律 **451**
+    // （Server: Quantum，「因法律原因不可用」只对外国 IP 生效）。
+    // 留开关是因为换个节点可能就通了 —— "走代理" 在别的节点上是合理选项。
+    var javchuProxy by remember {
+        mutableStateOf(com.han1me.X99.setting(com.han1me.lab.GlobalProxy.JAVCHU_ROUTE_KEY, "direct") == "proxy")
+    }
     Column {
+        HplaySectionGroup("javchu 路由") {
+            HplaySwitchRow(
+                title = "javchu 走内置节点",
+                checked = javchuProxy,
+                subtitle = "关闭（默认）= 直连。当前节点下 javchu 的媒体 CDN 对外国 IP 回 451，" +
+                    "只有直连才播得了；换节点后若代理更快可打开。",
+                icon = "🌐",
+                onCheckedChange = { on ->
+                    javchuProxy = on
+                    com.han1me.X99.putSetting(
+                        com.han1me.lab.GlobalProxy.JAVCHU_ROUTE_KEY,
+                        if (on) "proxy" else "direct",
+                    )
+                    // 让下一次请求立刻按新路由走（GlobalProxy 的选择是每请求实时判定的，无需重启）
+                    com.han1me.lab.LabLog.i("proxy", "javchu 路由 -> " + (if (on) "proxy" else "direct"))
+                },
+            )
+        }
         HplaySectionGroup("内置节点") {
             Column(Modifier.padding(14.dp)) {
                 Text(
@@ -95,13 +122,18 @@ fun DownloadSettingsContent() {
         HplaySectionGroup("并发分片") {
             Column(Modifier.padding(14.dp)) {
                 Text(
-                    "同时下载的分片数。默认 16 —— 实测这是本机带宽与设备解码的上限；" +
-                        "再高会互相抢带宽，总速度反而下降。",
+                    "同时下载的分片数。默认 32。\n\n" +
+                        "多线程 CDN 常见「每连接限速」（实测 t33 每连接约 0.11 MB/s），" +
+                        "所以总速度 ≈ 连接数 × 单连接速度：16 路≈1.7、32 路≈3、64 路≈5~6 MB/s。\n\n" +
+                        "调太高（96 以上）会被连接建立开销吃掉，且手机内存/线程压力大。",
                     color = cs.onSurfaceVariant, fontSize = 11.sp, lineHeight = 16.sp,
                 )
                 Spacer(Modifier.height(10.dp))
+                // ★ 第 352 轮：档位按实测重排。旧档位 8/16/24 的「16」是当上限设计的，
+                // 而 16 路在 t33 上只有 1.75 MB/s；实测 32→2.9~3.4、64→4.8~6.4、96→7.2。
+                // 现在给 16/32/48/64 四档（默认 32），让用户能真的调到自己的带宽上限。
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("8", "16", "24").forEach { v ->
+                    listOf("16", "32", "48", "64").forEach { v ->
                         HplayChip(
                             text = v + " 路",
                             selected = conc == v,

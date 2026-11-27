@@ -124,6 +124,9 @@ object GlobalProxy {
         //
         // 判据用**后缀**而不是写死 t33：站点换 t 号是常态（实测 t27 回 404、t33 回 451），
         // 写死主机名下次就又失效。
+        // ★★ 第 352 轮（用户要求「设置 网络里加一项 javchu 路由开关」）：
+        // 是否直连改成**可切换**，默认仍走直连（本轮实测：直连 200，走节点 451）。
+        // 开关值放 X99 设置 `net.javchu.route`（值 direct / proxy），见 javchuDirect()。
         "cdn2020.com",
         // 第 351 轮同类问题：javchu 的封面图床。设备日志里连续 4 条
         // 「SSLPeerUnverifiedException: Hostname tutu1.space not verified」——
@@ -141,12 +144,36 @@ object GlobalProxy {
         "tangxin.xyz",   // 糖心 CDN 的别名族（与 5gcdn.xyz 同一家）
     )
 
+    /**
+     * 第 352 轮：**javchu 一族是否走直连**（设置页可切）。
+     *
+     * 默认 `direct` —— 实测（2026-11-27）：`t33.cdn2020.com` 直连 200 + 完整 m3u8 +
+     * 分片全部 200；经内置节点（美西）一律 **451**（Server: Quantum，只对外国 IP 生效）。
+     * 所以「走代理」在本节点下必然播不了，但**换个节点可能就行**，因此留开关而不是写死。
+     */
+    private fun javchuDirect(): Boolean = runCatching {
+        com.han1me.X99.setting(JAVCHU_ROUTE_KEY, "direct") != "proxy"
+    }.getOrDefault(true)
+
+    /** javchu 一族的域（页面 + 媒体 + 封面图床）。 */
+    private val JAVCHU_HOSTS = listOf("javchu.com", "cdn2020.com", "tutu1.space")
+
+    private fun isJavchu(h: String): Boolean {
+        for (d in JAVCHU_HOSTS) if (h == d || h.endsWith("." + d)) return true
+        return false
+    }
+
     private fun alwaysDirect(host: String): Boolean {
         val h = host.lowercase()
+        // ★ 第 352 轮：javchu 一族受开关控制，先判它（否则下面的固定表会盖掉开关）
+        if (isJavchu(h)) return javchuDirect()
         for (d in ALWAYS_DIRECT) if (h == d || h.endsWith("." + d)) return true
         for (d in ALWAYS_DIRECT_SUFFIX) if (h == d || h.endsWith("." + d)) return true
         return false
     }
+
+    /** 设置键（设置页读写同一个）。 */
+    const val JAVCHU_ROUTE_KEY = "net.javchu.route"
 
     /**
      * 第 351 轮：**这个 host 现在走哪条路**（诊断用，日志里能直接读出结论）。

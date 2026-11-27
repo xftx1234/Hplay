@@ -74,6 +74,40 @@ fun HplaySettingsHost(
         )
         SettingsPage.APPEARANCE -> AppearanceSettingsScreen(onBack = ::back)
         SettingsPage.NETWORK -> SettingsScaffold("网络", ::back) {
+            // ★★★ 第 352 轮（用户要求「设置 网络里加一项 javchu 路由开关」）：**放在最上面**。
+            //
+            // 它是本页唯一一个「影响具体站点能否播放」的开关，比节点列表更需要先看到。
+            // 默认关（= 直连）：实测 t33.cdn2020.com 走内置节点一律 451，只有直连能播。
+            item {
+                val javchuProxy = remember {
+                    mutableStateOf(
+                        com.han1me.X99.setting(com.han1me.lab.GlobalProxy.JAVCHU_ROUTE_KEY, "direct") == "proxy",
+                    )
+                }
+                HplaySectionGroup("javchu 路由") {
+                    HplaySwitchRow(
+                        title = "javchu 走内置节点",
+                        checked = javchuProxy.value,
+                        subtitle = "关闭（默认）= 直连。当前节点下 javchu 的媒体 CDN 对外国 IP 回 451，",
+                        icon = "🎬",
+                        onCheckedChange = { on ->
+                            javchuProxy.value = on
+                            com.han1me.X99.putSetting(
+                                com.han1me.lab.GlobalProxy.JAVCHU_ROUTE_KEY,
+                                if (on) "proxy" else "direct",
+                            )
+                            com.han1me.lab.LabLog.i("proxy", "javchu 路由 -> " + if (on) "proxy" else "direct")
+                        },
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        "改完立即生效（每个请求都按当前开关实时选路），不需要重启或重连节点。",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 11.sp, lineHeight = 16.sp,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    )
+                }
+            }
             // ★ 2026-11-25（第 286 轮）：**边缘节点板块补回**。
             // 用户反馈「设置-网络里没有边缘节点板块，只有内置节点」——
             // 重构设置页时只注入了 NodeSection，漏了 EdgeSection。

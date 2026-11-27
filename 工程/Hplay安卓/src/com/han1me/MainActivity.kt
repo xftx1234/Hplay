@@ -61,8 +61,33 @@ class MainActivity : ComponentActivity() {
         runCatching { com.han1me.ui.HplayMotion.refresh(this) }
     }
 
+    /**
+     * ★★★ 第 352 轮（用户报「通知栏点击下载中的通知不跳转正在下载页」）：
+     *
+     * 下载通知的 PendingIntent 现在带 `hplay.open=downloads`。Activity 已在栈顶时
+     * 系统走 onNewIntent（不重建 Activity），所以这里必须实现它并分发 ——
+     * 少了这个方法，`FLAG_ACTIVITY_SINGLE_TOP` 的 Intent 会被**静默丢弃**。
+     */
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        dispatchNav(intent)
+    }
+
+    /** 把 Intent 里的「要开哪一页」翻译成 [HplayNavRequest]，由 Compose 侧消费。 */
+    private fun dispatchNav(intent: android.content.Intent?) {
+        @Suppress("DEPRECATION")
+        val what = intent?.getStringExtra(HplayNavRequest.EXTRA_OPEN)
+        if (!what.isNullOrBlank()) {
+            HplayNavRequest.request(what)
+            com.han1me.lab.LabLog.i("nav", "入口请求：" + what)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 第 352 轮：冷启动也认这个 extra（进程被杀后点通知是走 onCreate，不是 onNewIntent）
+        dispatchNav(intent)
         HplayEnv.init(this, this)
         // ★ 第 339 轮（用户要求「默认最高帧率可根据系统自动调节」）：探测面板上限，
         // 只在动画期间提升，静止时交还系统（见 ui/HplayFrameRate.kt 的三层说明）。
