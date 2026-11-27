@@ -2416,6 +2416,16 @@ object HplayDownloads {
                             // 找到就用它的封面地址；找不到才如实计失败，不再「点了没反应」。
                             thumb = runCatching { X99.findThumbByTitle(task.item.title) }.getOrDefault("")
                         }
+                        if (thumb.isBlank()) {
+                            // ★★★ 第 353 轮（用户报「糖心下载的视频没封面」）：**糖心的封面有固定规则**，
+                            // 直接从详情页 URL 推：`https://t.5gcdn.xyz/videos/<id>/cover.jpg`。
+                            // 下载记录里 pageUrl / srcUrl 至少有一个是 `…/v/<id>/` 形态，
+                            // 取最后一段当 id 就能拼出来 —— 不需要任何网络请求，也不会误命中。
+                            // 这是「规则型板块」的兜底：有规则的板块不该依赖模糊标题匹配。
+                            thumb = runCatching {
+                                com.han1me.tx.TxBoard.coverUrlOf(task.pageUrl.ifBlank { task.item.srcUrl })
+                            }.getOrDefault("")
+                        }
                         var got = false
                         if (thumb.isNotBlank()) {
                             val (bytes, why2) = fetchCoverBytes(thumb, task.pageUrl, coverSweepDeadHosts)
@@ -2476,6 +2486,9 @@ object HplayDownloads {
      * 跳过同域其余写法/任务），不污染收藏页共享的 thumbFailCount/thumbDeadUntil。
      * @return 字节 + 失败原因（失败原因原样上报，扫补汇总进日志便于诊断）
      */
+    /** 第 353 轮：每域**连续**连接失败计数（成功即清零）。连续 4 次才认该域不可用。 */
+    private val coverFailStreak = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
     private fun fetchCoverBytes(url: String, refererPage: String, deadHosts: MutableSet<String>): Pair<ByteArray?, String> {
         val host = hostOf(url)
         if (host.isNotEmpty() && coverSweepDeadHosts.contains(host)) {
@@ -2513,11 +2526,31 @@ object HplayDownloads {
             }.getOrElse { null to "请求异常 " + (it.message?.take(48) ?: "") }
             val bytes = r.first
             why = r.second
-            if (bytes != null) return bytes to ""
-            // 连接层失败：本轮内同域其余任务不再空耗（20s 超时 × N 张会拖死整轮）
-            if (why.startsWith("请求异常") || why.contains("timeout", true) ||
-                why.contains("Failed to connect", true) || why.contains("Unable to resolve", true)) {
-                if (host.isNotEmpty()) coverSweepDeadHosts.add(host)
+            if (bytes != null) {
+                // 第 353 轮：成功一次就把该域的连续失败计数清零
+                if (host.isNotEmpty()) coverFailStreak.remove(host)
+                return bytes to ""
+            }
+            // ★★★ 第 353 轮（用户报「封面补全按钮基本上无效」）：**这里原来是个一刀切的域封杀**。
+            //
+            // 旧逻辑：任意一张图的连接层失败 ⇒ 把**整个 host** 加进 coverSweepDeadHosts，
+            // 同域剩下的全部直接判死（连试都不试）。
+            //
+            // 后果（本轮实测复现）：糖心的 `t.5gcdn.xyz`、javchu 的 `tutu1.space` 这类
+            // 单点图床，只要**第一张**恰好赶上 TLS 抖动/瞬断，整批 200 条全部报
+            // 「图床已判死」，用户点「补全封面」看到的永远是失败 —— 这就是「点了没反应」。
+            //
+            // 现在：**只有连续失败才封域**。给每个域一个「连续失败计数 + 成功即清零」，
+            // 连续 4 次连接层失败才认这个域本轮不可用。偶发抖动不再拖垮整批。
+            val connLevelFail = why.startsWith("请求异常") || why.contains("timeout", true) ||
+                why.contains("Failed to connect", true) || why.contains("Unable to resolve", true)
+            if (connLevelFail && host.isNotEmpty()) {
+                val streak = (coverFailStreak[host] ?: 0) + 1
+                coverFailStreak[host] = streak
+                if (streak >= 4) {
+                    coverSweepDeadHosts.add(host)
+                    com.han1me.lab.LabLog.i("cover", "图床 " + host + " 连续 " + streak + " 次连接失败，本轮跳过")
+                }
             }
         }
         return null to why

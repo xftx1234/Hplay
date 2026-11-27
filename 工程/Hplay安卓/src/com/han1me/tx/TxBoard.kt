@@ -199,6 +199,24 @@ object TxBoard {
      * 详情：先用「索引 + 直链规则」直接给结果（零额外请求），失败再抓详情页解析 JSON-LD。
      * 直链规则 30/30 实测成立，所以绝大多数情况下详情是**纯本地**的。
      */
+    /**
+     * 第 353 轮：**按 URL 规则直接给出封面地址**（零网络请求）。
+     *
+     * 糖心是「索引 + 规则」型站点：封面恒为 `CDN + <id> + "/cover.jpg"`，
+     * 与 [videoOf] 完全同一条公式。下载记录里的 pageUrl / srcUrl 形如
+     * `https://tangxinvlog.app/v/<id>/`，取路径里 `v` 之后那一段就是 id。
+     *
+     * 为什么需要它：封面补全原来的三级救援（sidecar thumb → 重抓详情 → 标题模糊匹配）
+     * 对糖心全都不可靠 —— sidecar 里 thumb 为空、标题匹配要列表缓存里恰好有同名条目。
+     * 有固定规则的站点就该按规则算，不该赌模糊匹配。
+     *
+     * @return 封面 URL；URL 里认不出 id 时返回空串（调用方如实计「无来源」）。
+     */
+    fun coverUrlOf(pageUrl: String): String {
+        val id = idOf(pageUrl)
+        return if (id.isBlank()) "" else CDN + id + "/cover.jpg"
+    }
+
     fun detail(v: HanimeVideo): HanimeDetail? {
         val id = v.id.ifBlank { idOf(v.url) }
         if (id.isBlank()) return null
@@ -206,8 +224,20 @@ object TxBoard {
         val m3u8 = CDN + id + "/index.m3u8"
         AppLog.step("tx.DETAIL", "id=" + id + " m3u8=" + m3u8)
         LabLog.i("tx", "详情 " + id + " 直链=" + m3u8)
+        // ★★★ 第 353 轮（用户报「糖心板块的下载视频没有封面，连收藏页封面也没了」）：
+        //
+        // 这里原来写的是 `video = v` —— **原样返回调用方传进来的对象**。
+        // 而 thumb 只有 [videoOf]（列表卡片）会填；从收藏 / 下载记录 / 历史打开详情时，
+        // 传进来的 `v` 是不带 thumb 的（那些地方只存了 url/title/id）。
+        // 于是详情页 thumb 为空 ⇒ 下载时 cacheSidecars 拿到空 thumb ⇒ 封面永远缓存不上 ⇒
+        // 「下载的视频没封面，连收藏页也没封面」。
+        //
+        // 糖心的封面有固定规则（CDN + id + "/cover.jpg"，与 [videoOf] 完全一致），
+        // 所以这里**无条件按规则补**：有 thumb 就保留调用方的（可能是更高清的），
+        // 没有就按规则生成 —— 这与列表卡片同源，不会出现两套地址。
+        val withThumb = if (v.thumb.isNotBlank()) v else v.copy(thumb = CDN + id + "/cover.jpg")
         return HanimeDetail(
-            video = v,
+            video = withThumb,
             description = it?.let { buildDesc(it) } ?: "",
             tags = it?.tags ?: emptyList(),
             sources = listOf(0 to m3u8),

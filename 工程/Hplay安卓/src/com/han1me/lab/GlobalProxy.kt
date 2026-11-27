@@ -127,11 +127,8 @@ object GlobalProxy {
         // ★★ 第 352 轮（用户要求「设置 网络里加一项 javchu 路由开关」）：
         // 是否直连改成**可切换**，默认仍走直连（本轮实测：直连 200，走节点 451）。
         // 开关值放 X99 设置 `net.javchu.route`（值 direct / proxy），见 javchuDirect()。
-        "cdn2020.com",
-        // 第 351 轮同类问题：javchu 的封面图床。设备日志里连续 4 条
-        // 「SSLPeerUnverifiedException: Hostname tutu1.space not verified」——
-        // 走节点时 CDN 回的是别人家的证书（节点侧回源错乱），直连则是正常证书。
-        "tutu1.space",
+        // ★ 第 353 轮：cdn2020.com / tutu1.space 已移到 JAVCHU_MEDIA_HOSTS 统一管理
+        // （它们的判定必须先于这张表，否则开关对页面域失效）。这里不再重复列。
     )
 
     /**
@@ -145,28 +142,60 @@ object GlobalProxy {
     )
 
     /**
-     * 第 352 轮：**javchu 一族是否走直连**（设置页可切）。
+     * 第 353 轮：**javchu 页面域是否走直连**（设置页可切）。
      *
-     * 默认 `direct` —— 实测（2026-11-27）：`t33.cdn2020.com` 直连 200 + 完整 m3u8 +
-     * 分片全部 200；经内置节点（美西）一律 **451**（Server: Quantum，只对外国 IP 生效）。
-     * 所以「走代理」在本节点下必然播不了，但**换个节点可能就行**，因此留开关而不是写死。
+     * ★ 默认改成 **proxy**（走节点）。理由来自用户本轮实测日志：
+     *   route=direct 时 javchu.com 直接被 RST（`SocketException: Connection reset`，四次全失败）；
+     *   route=proxy  时同一请求 200 / Server=cloudflare。
+     *
+     * 上一版默认 direct 是**只看了媒体域**得出的结论（cdn2020 直连 200、代理 451），
+     * 却把页面域一起带上了 —— 于是「默认状态下连列表都打不开」。
+     * 现在默认 proxy（页面能开），媒体域则独立地永远直连（见 [JAVCHU_MEDIA_HOSTS]）。
      */
     private fun javchuDirect(): Boolean = runCatching {
-        com.han1me.X99.setting(JAVCHU_ROUTE_KEY, "direct") != "proxy"
-    }.getOrDefault(true)
+        com.han1me.X99.setting(JAVCHU_ROUTE_KEY, "proxy") != "direct"
+    }.getOrDefault(false)
 
-    /** javchu 一族的域（页面 + 媒体 + 封面图床）。 */
-    private val JAVCHU_HOSTS = listOf("javchu.com", "cdn2020.com", "tutu1.space")
+    /**
+     * ★★★ 第 353 轮（用户实测：「javchu 直连默认报错，切换路由开关后可加载了但没有原生播放接口」）：
+     * **上一版把「页面域」和「媒体域」绑在同一个开关上，这是设计错误。**
+     *
+     * 日志证据（hplay-log-20261128-004156.txt）：
+     *   route=direct 时  javchu.com/        -> SocketException: Connection reset（页面开不了）
+     *   route=proxy  时  javchu.com/        -> 200 Server=cloudflare（页面能开）
+     *   route=proxy  时  t33.cdn2020.com…  -> **451** Server=Quantum（媒体取不到 ⇒ 没有直链）
+     *
+     * 两边的需求**正好相反**：
+     *   · javchu.com   ：Cloudflare 前置，直连被 RST，**必须走代理**；
+     *   · cdn2020.com  ：媒体 CDN，451 只对外国 IP 生效，**必须直连**；
+     *   · tutu1.space  ：封面图床，证书只对国内回正常，**必须直连**。
+     *
+     * 所以拆成两个清单：页面域受开关控制（默认走代理），媒体域**永远直连**。
+     * 这样「页面能开」和「直链拿得到」同时成立 —— 这才是「真实接线且保证可原生直链接播放下载」。
+     */
+    private val JAVCHU_PAGE_HOSTS = listOf("javchu.com")
 
-    private fun isJavchu(h: String): Boolean {
-        for (d in JAVCHU_HOSTS) if (h == d || h.endsWith("." + d)) return true
+    /** 媒体 / 图床域：**不受开关影响，永远直连**（走代理只会 451）。 */
+    private val JAVCHU_MEDIA_HOSTS = listOf("cdn2020.com", "tutu1.space")
+
+    private fun isJavchuPage(h: String): Boolean {
+        for (d in JAVCHU_PAGE_HOSTS) if (h == d || h.endsWith("." + d)) return true
+        return false
+    }
+
+    private fun isJavchuMedia(h: String): Boolean {
+        for (d in JAVCHU_MEDIA_HOSTS) if (h == d || h.endsWith("." + d)) return true
         return false
     }
 
     private fun alwaysDirect(host: String): Boolean {
         val h = host.lowercase()
-        // ★ 第 352 轮：javchu 一族受开关控制，先判它（否则下面的固定表会盖掉开关）
-        if (isJavchu(h)) return javchuDirect()
+        // ★★★ 第 353 轮：javchu 的**媒体域永远直连**（不受开关影响）。
+        // 走代理只会 451（只对外国 IP 生效），这是媒体侧唯一可行的路。
+        if (isJavchuMedia(h)) return true
+        // 页面域受开关控制：默认 proxy（走节点），见 javchuDirect 的注释。
+        // 开关为 proxy 时这里返回 false ⇒ 落到后面的 bypass/节点判定 ⇒ 走节点。
+        if (isJavchuPage(h)) return javchuDirect()
         for (d in ALWAYS_DIRECT) if (h == d || h.endsWith("." + d)) return true
         for (d in ALWAYS_DIRECT_SUFFIX) if (h == d || h.endsWith("." + d)) return true
         return false

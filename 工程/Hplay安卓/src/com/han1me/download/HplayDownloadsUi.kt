@@ -893,36 +893,36 @@ private fun ConcChooser(onDismiss: () -> Unit, onApplied: () -> Unit) {
         ) {
             Text("下载线程数", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(6.dp))
+            // ★★★ 第 353 轮（用户报「下载页面旧的下载线程板块修正并接线真正档位」）：
+            //
+            // 上一轮（352）把并发上限从 16 提到 64、默认 32，但**只改了设置页**，
+            // 这个下载页弹窗还硬写着 1..16 —— 于是弹窗里根本选不到 32/64，
+            // 用户看到的仍是「旧的线程板块」。现在两处共用 MAX_CONCURRENCY。
             Text(
-                "单个任务内部的分片并发数。1 = 串行最稳但慢；默认值经带宽实测标定，更高更快但遇到限流的站可能反而变慢（程序会按域自动降速）。" +
-                    "同时下载的任务数最多 " + HplayDownloads.MAX_PARALLEL_TASKS + " 个。",
+                "单个任务内部的分片并发数。多线程 CDN 常见「每连接限速」" +
+                    "（实测 t33 每连接约 0.11 MB/s），总速度≈连接数×单连接速度：" +
+                    "16 路≈1.7、32 路≈3、64 路≈5~6 MB/s。\n\n" +
+                    "1 = 串行最稳但慢；调太高（96+）会被连接建立开销吃掉。同时下载的任务数最多 " +
+                    HplayDownloads.MAX_PARALLEL_TASKS + " 个。",
+                color = TextDim, fontSize = 11.sp, lineHeight = 16.sp,
             )
             Spacer(Modifier.height(10.dp))
-                // ★ 第 156 轮修（用户报「只显示到 9，后面的没有」）：
-                // 16 个按钮横排会超出弹窗宽度被裁掉，改为两行各 8 个。
+                // ★ 第 156 轮：16 个按钮横排会超出弹窗宽度被裁掉，改多行。
+                // ★ 第 353 轮：上限跟随 MAX_CONCURRENCY（64），每行 8 个自动换行。
+                val maxN = HplayDownloads.MAX_CONCURRENCY
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        (1..8).forEach { i ->
-                            Text(
-                                i.toString(),
-                                color = if (i == n) Color.White else TextDim,
-                                fontSize = 12.5.sp,
-                                modifier = Modifier.clip(RoundedCornerShape(14.dp))
-                                    .background(if (i == n) AccentRed else CardColorSoft)
-                                    .clickable { n = i }.padding(horizontal = 10.dp, vertical = 6.dp),
-                            )
-                        }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        (9..16).forEach { i ->
-                            Text(
-                                i.toString(),
-                                color = if (i == n) Color.White else TextDim,
-                                fontSize = 12.5.sp,
-                                modifier = Modifier.clip(RoundedCornerShape(14.dp))
-                                    .background(if (i == n) AccentRed else CardColorSoft)
-                                    .clickable { n = i }.padding(horizontal = 10.dp, vertical = 6.dp),
-                            )
+                    (1..maxN).chunked(8).forEach { row ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            row.forEach { i ->
+                                Text(
+                                    i.toString(),
+                                    color = if (i == n) Color.White else TextDim,
+                                    fontSize = 12.5.sp,
+                                    modifier = Modifier.clip(RoundedCornerShape(14.dp))
+                                        .background(if (i == n) AccentRed else CardColorSoft)
+                                        .clickable { n = i }.padding(horizontal = 7.dp, vertical = 6.dp),
+                                )
+                            }
                         }
                     }
                 }
