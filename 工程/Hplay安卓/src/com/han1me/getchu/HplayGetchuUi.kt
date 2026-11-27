@@ -62,7 +62,21 @@ import com.han1me.HplayOutline
  * 取不到时**如实显示原因**，并给「重试」。
  */
 @Composable
-fun GetchuPreviewContent(onBack: () -> Unit, onOpenUrl: (String, String) -> Unit) {
+fun GetchuPreviewContent(
+    onBack: () -> Unit,
+    onOpenUrl: (String, String) -> Unit,
+    /**
+     * ★ 第 342 轮（用户报「getchu 预告的内板块详情没有接线，点击卡片无响应」）：
+     *
+     * 原来卡片点击只走 [onOpenUrl] → 宿主的 webPage = WebPage(...)，也就是打开**内置网页浏览器**。
+     * 而宿主那边 showGetchu 覆盖层是**后绘制**的（z 序在上），于是刚打开的网页立刻被
+     * Getchu 列表盖住 —— 用户看到的就是「点了完全没反应」。
+     *
+     * 现在卡片默认进**内置详情页**（GetchuDetailContent），与「新番预告页」的行为一致；
+     * 详情页里那个「转到网页」按钮仍然可以把原站页面丢给浏览器。
+     */
+    onOpenDetail: (String, String) -> Unit = { _, _ -> },
+) {
     var monthCode by remember { mutableStateOf(HplayGetchu.currentMonthCode()) }
     var page by remember { mutableStateOf<HplayGetchu.Page?>(null) }
     var loading by remember { mutableStateOf(true) }
@@ -188,7 +202,7 @@ fun GetchuPreviewContent(onBack: () -> Unit, onOpenUrl: (String, String) -> Unit
                                 verticalAlignment = Alignment.Top,
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp)
                                     .clip(RoundedCornerShape(10.dp)).background(CardColor)
-                                    .clickable { onOpenUrl(it0.detailUrl, it0.title) }
+                                    .clickable { onOpenDetail(it0.id, it0.title) }
                                     .padding(10.dp),
                             ) {
                                 Box(
@@ -220,7 +234,7 @@ fun GetchuPreviewContent(onBack: () -> Unit, onOpenUrl: (String, String) -> Unit
                                     Spacer(Modifier.height(6.dp))
                                     Text(
                                         "打开详情 ›", color = AccentRed, fontSize = 11.5.sp,
-                                        modifier = Modifier.clickable { onOpenUrl(it0.detailUrl, it0.title) },
+                                        modifier = Modifier.clickable { onOpenDetail(it0.id, it0.title) },
                                     )
                                 }
                             }

@@ -32,7 +32,7 @@ import kotlinx.coroutines.delay
  *    更新检查也挤进去只会让首屏更慢，而用户此刻根本不在乎有没有新版。
  * 2. **每次进程生命周期只查一次**（[HplayUpdateState.startupChecked]）：
  *    这个 composable 会在重组时反复进入，不设标记就会反复发请求 ——
- *    匿名 GitHub 只有 60 次/小时，139 那边也有频率限制。
+ *    匿名 GitHub 只有 60 次/小时。
  * 3. **尊重用户开关**（[HplayUpdateChannel.autoCheck]）：
  *    用户关掉了就是关掉了，不能靠"反正查一下也没事"越过。
  *

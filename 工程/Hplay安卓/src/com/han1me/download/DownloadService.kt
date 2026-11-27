@@ -230,7 +230,22 @@ class DownloadService : Service() {
         val anyRunning = runCatching {
             HplayDownloads.tasks.value.any { it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED }
         }.getOrDefault(false)
-        val b = Notification.Builder(this, CHANNEL_ID)
+        // ★★★ 第 344 轮（全量核查 · P0）：**API 24/25 上这里会抛 NoSuchMethodError**。
+        //
+        // Notification.Builder(Context, String) 是 **API 26 才加的**构造函数，
+        // 而 build.py 的 MIN_SDK 是 24。在 Android 7.x 上 new 这个构造直接抛
+        // NoSuchMethodError（是 Error，不是 Exception），startForeground 外层的
+        // runCatching 接不住 —— 下载服务当场崩溃，用户点下载就闪退。
+        //
+        // ensureChannel() 做了 SDK 保护，buildNotificationInner 这里漏了。
+        // 现在按版本分两路：26+ 用带 channel 的构造（渠道生效、用户能单独静音），
+        // 24/25 用老构造 + setPriority(LOW) —— 老系统本来就没有渠道概念。
+        val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this).setPriority(Notification.PRIORITY_LOW)
+        }
             // 图标保持本应用特色（用户要求）：沿用系统下载图标形状 + 本应用的渠道，
             // 不换成第三方应用的图案。小图标在状态栏是单色剪影，用系统那个最稳。
             .setSmallIcon(android.R.drawable.stat_sys_download)

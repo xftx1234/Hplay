@@ -40,6 +40,7 @@ object HplayWebProxy {
     /** 走 GlobalProxy 的客户端。连接池放大 + 长超时（经节点的首包可能偏慢）。 */
     private val http by lazy {
         okhttp3.OkHttpClient.Builder()
+            .addInterceptor(com.han1me.log.LoggingInterceptor)
             .proxySelector(GlobalProxy.selector())
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)

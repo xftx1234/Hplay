@@ -225,21 +225,24 @@ fun BackupAccountSettings(
                 }
 
                 Spacer(Modifier.height(4.dp))
-                CTA("＋ 添加账户（网页登录）", cs.primary.copy(alpha = 0.16f), cs.primary) {
-                    // 自己起登录页 —— 设置层是独立覆盖层，没有宿主可回调；
-                    // 直接 startActivity 与用户页「登录/注册」走同一条路（同一个 Activity）。
-                    val ok = runCatching {
-                        val i = android.content.Intent(ctx, com.han1me.lab.LoginActivity::class.java)
-                        i.putExtra(com.han1me.lab.LoginActivity.EXTRA_URL, "https://hanime1.me/login")
-                        i.flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
-                        com.han1me.lab.LoginActivity.onFinished = { ck ->
-                            if (ck.isNotEmpty()) tick++
+                CTA("＋ 添加账户（验证 + 登录）", cs.primary.copy(alpha = 0.16f), cs.primary) {
+                    // ★ 第 338 轮（用户报「添加账户还是另一个账户的登录态」）：
+                    //
+                    // 根因是 CookieManager 进程级共享 —— 原来这里直接起 LoginActivity，
+                    // 而 WebView 里还挂着上一个账户的会话，打开 /login 会**自动跳回已登录状态**，
+                    // 用户根本没有输入第二个账号的机会，看起来就是「添加了还是原来的账户」。
+                    //
+                    // 现在走 HplayGateLauncher(fresh = true)：先 removeAllCookies 再加载首页，
+                    // web 这边是新会话，可以登录第二个账号；过盾与登录也在同一页一次做完。
+                    com.han1me.lab.HplayGateLauncher.open(ctx, fresh = true) { ck ->
+                        if (ck.isNotEmpty()) {
+                            tick++
+                            say("新账户已保存，可在上面切换")
+                        } else {
+                            say("已取消（未保存）")
                         }
-                        ctx.startActivity(i)
-                        true
-                    }.getOrDefault(false)
-                    if (!ok) say("无法打开登录页") else say("已打开登录页，登录完成后回来这里即可看到账户")
-                    onAddAccount()
+                        onAddAccount()
+                    }
                 }
             }
         }

@@ -4,35 +4,44 @@ import android.content.Context
 import com.han1me.X99
 
 /**
- * **发布线与更新渠道**（第 331 轮）。
+ * **发布线与更新渠道**（第 331 轮建立；第 332 轮重做）。
  *
- * ## 用户要的四条来源要能自由选
+ * ## 第 332 轮：139 直连渠道**整条移除**
  *
- * 原话：「app 检查更新内新增 cl 更新渠道，可选实验版和主线版自由更新」——
- * 「cl」是「CI」的输入误差，结合上下文（两个参考项目都有 CI 渠道）判断为 CI。
+ * 用户原话：「彻底去除 139 直连相关更新渠道，代码层也去掉，改成 github 默认 + 自建垫底」。
  *
- * 于是更新来源一共四条，**全部保留、互不替代**：
+ * 移除理由（用户没说，但从工程角度是硬理由）：
+ *  · 139 需要一条 Basic 凭据（pc:<手机号>:<token>）才能取清单与直链。
+ *    这条凭据等价于两个移动云盘账号的访问权，而 APK 是公开分发的 ——
+ *    第 331 轮实测发现它能被原样编进 classes*.dex，只能靠 --no-cred 剥掉。
+ *    剥掉之后 139 渠道在公开发布版里**本来就用不了**：留着一条默认就失效的渠道
+ *    只会让用户看到「未配置凭据」的失败页。
+ *  · GitHub Release 不需要任何凭据，公网匿名可读，天然适合公开分发。
  *
- * | 来源 | 取什么 | 谁在用 |
+ * 于是现在的渠道只剩三条，**GitHub 是默认，自建网盘垫底**：
+ *
+ * | 渠道 | 取什么 | 凭据要求 |
  * |---|---|---|
- * | [CH_YUN139]   | 移动云盘 139 直连（公网可达，出门也能查） | 既有主通道 |
- * | [CH_NETDISK]  | 自建网盘 OpenList（4 个挂载目录轮询）      | 既有兜底 |
- * | [CH_GITHUB]   | GitHub Releases（默认读本线的正式版）      | **本轮新增** |
- * | [CH_CI]       | GitHub Releases 里 `ci-*` 标签的预发布构建 | **本轮新增** |
+ * | CH_GITHUB  | GitHub Releases 本线正式发布 | 无（匿名） |
+ * | CH_CI      | GitHub 上 ci-* 标签的预发布构建 | 无（匿名） |
+ * | CH_NETDISK | 自建网盘 OpenList（多挂载目录轮询） | 无（只读 API） |
  *
  * ## 两条发布线
  *
- * · **实验版**（lab）：分支 `lab`，tag 前缀 `lab-v`，Release 标 prerelease。
- * · **主线版**（stable）：分支 `main`，tag 前缀 `v`，Release 是正式版。
+ * · **实验版**（lab）：分支 lab，tag 前缀 lab-v，Release 标 prerelease。
+ * · **主线版**（stable）：分支 main，tag 前缀 v，Release 是正式版。
  *
  * 两条线**包名与签名相同**（见 build.py 的 PACKAGE 注释），所以能互相覆盖安装。
- * 用户可以装实验版、在更新页把线切到主线版、下主线的新包覆盖上去 —— 反之亦然。
- * 这条能力是用户明确要求的（「实现两个版本可覆盖升级」）。
  *
- * ## 为什么渠道要存成「用户选择」而不是「构建常量」
+ * ## 默认值口径
  *
- * 构建期只知道自己是哪条线（[HplayBuildInfo.GH_LINE]），那只是**默认值**。
- * 用户切过之后以用户的为准 —— 否则实验版用户永远看不到主线版。
+ * 用户要求「自动检查更新默认 github 实验版」。所以：
+ *  · 默认渠道 = CH_GITHUB（与构建线无关，两条线都默认 GitHub）；
+ *  · 默认发布线 = LINE_LAB（实验版），**即使这个包是主线版构建的**。
+ *
+ * 第二条是有意的：用户明确说「默认 github 实验版」。主线版的用户想看主线更新时，
+ * 在更新页把线切过去即可（选择会持久化，不用每次改）。
+ * 但构建线仍然是 buildLine，界面会标注「本包」，让用户知道自己在跑哪条线的包。
  */
 object HplayUpdateChannel {
 
@@ -41,21 +50,18 @@ object HplayUpdateChannel {
     /** 主线版线标识。 */
     const val LINE_STABLE = "stable"
 
-    /** 移动云盘 139 直连。 */
-    const val CH_YUN139 = "yun139"
-    /** 自建网盘（OpenList）。 */
-    const val CH_NETDISK = "netdisk"
-    /** GitHub Releases 正式版。 */
+    /** GitHub Releases 正式版。**默认渠道**。 */
     const val CH_GITHUB = "github"
     /** GitHub Releases 的 CI 预发布构建。 */
     const val CH_CI = "ci"
+    /** 自建网盘（OpenList）—— 垫底通道。 */
+    const val CH_NETDISK = "netdisk"
 
-    /** 四条渠道的展示名（设置页顺序即此顺序）。 */
+    /** 三条渠道的展示名（界面顺序即此顺序：GitHub 在前 = 默认）。 */
     val CHANNELS: List<Pair<String, String>> = listOf(
-        CH_YUN139 to "移动云盘 139（直连）",
-        CH_NETDISK to "自建网盘（兜底）",
         CH_GITHUB to "GitHub Releases",
         CH_CI to "GitHub CI 构建",
+        CH_NETDISK to "自建网盘（垫底）",
     )
 
     /** 两条发布线的展示名。 */
@@ -68,13 +74,13 @@ object HplayUpdateChannel {
     private const val K_CHANNEL = "update.channel"
     private const val K_AUTO = "update.autoCheck"
 
-    /** 构建时所属的线（[HplayBuildInfo.GH_LINE] 的合法化版本）。 */
+    /** 构建时所属的线（HplayBuildInfo.GH_LINE 的合法化版本）。 */
     val buildLine: String
         get() = if (HplayBuildInfo.GH_LINE == LINE_STABLE) LINE_STABLE else LINE_LAB
 
-    /** 用户选的线。没选过就跟随构建所属的线。 */
+    /** 用户选的线。没选过就是**实验版**（用户要求「默认 github 实验版」）。 */
     var line: String
-        get() = X99.setting(K_LINE, buildLine).let {
+        get() = X99.setting(K_LINE, LINE_LAB).let {
             if (it == LINE_STABLE) LINE_STABLE else LINE_LAB
         }
         set(v) {
@@ -82,20 +88,19 @@ object HplayUpdateChannel {
         }
 
     /**
-     * 用户选的渠道。没选过时：实验版默认 139（既有主通道），主线版默认 GitHub。
+     * 用户选的渠道。没选过就是 GitHub。
      *
-     * 为什么实验版不默认 GitHub：139 那条是既有的、已验证能跑满的通道，
-     * 换默认值等于把现有用户的更新链路切到未验证的新路上。
-     * GitHub 在实验版里是**可选**的第二渠道（用户原话：「检查更新拿 github 作为备用渠道2」）。
+     * 存的值若已不在列表里（例如旧版本留下的 yun139），这里会**回落 GitHub** ——
+     * 用 any{} 而不是 contains，是因为 CHANNELS 是 Pair 列表，contains 要整个 Pair。
      */
     var channel: String
         get() {
             val v = X99.setting(K_CHANNEL, "")
-            if (v in CHANNELS.map { it.first }) return v
-            return if (buildLine == LINE_STABLE) CH_GITHUB else CH_YUN139
+            if (CHANNELS.any { it.first == v }) return v
+            return CH_GITHUB
         }
         set(v) {
-            if (v in CHANNELS.map { it.first }) X99.putSetting(K_CHANNEL, v)
+            if (CHANNELS.any { it.first == v }) X99.putSetting(K_CHANNEL, v)
         }
 
     /** 开屏是否自动检查更新（默认开）。 */
@@ -125,9 +130,23 @@ object HplayUpdateChannel {
     /** 仓库地址（网页用）。 */
     val repoUrl: String get() = "https://github.com/" + HplayBuildInfo.GH_REPO
 
-    /** 清掉用户选择，回到构建默认（设置页「恢复默认」用）。 */
+    /** 清掉用户选择，回到默认（GitHub + 实验版）。 */
     fun resetToBuildDefaults(ctx: Context) {
-        X99.putSetting(K_LINE, buildLine)
-        X99.putSetting(K_CHANNEL, if (buildLine == LINE_STABLE) CH_GITHUB else CH_YUN139)
+        X99.putSetting(K_LINE, LINE_LAB)
+        X99.putSetting(K_CHANNEL, CH_GITHUB)
+    }
+
+    /**
+     * 迁移旧的渠道值（第 332 轮）。
+     *
+     * 旧版本可能存过 yun139（已删除）。getter 已经会回落 GitHub，
+     * 但**磁盘上的旧值不清掉** —— 万一以后要恢复那条渠道，线索还在。
+     * 这里把非法值就地改写成 GitHub，让设置文件读起来是干净的。
+     */
+    fun migrateLegacy() {
+        val raw = X99.setting(K_CHANNEL, "")
+        if (raw.isNotEmpty() && CHANNELS.none { it.first == raw }) {
+            X99.putSetting(K_CHANNEL, CH_GITHUB)
+        }
     }
 }

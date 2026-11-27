@@ -393,8 +393,30 @@ object HplayDownloads {
         val native: Boolean,
         /** 分组名（参考 UI 的「未分组」）。 */
         val group: String,
+        /**
+         * 这条任务对应的**详情页地址**（不是媒体直链）。
+         *
+         * ★ 第 344 轮：以前只在 sidecar 里存，Job 上没有 —— 于是重启恢复后
+         * [req] 拿不到 pageUrl，Referer 退回进程级的 lastDetailUrl（指向"屏幕上那条"，
+         * 重启后是空的或别人的片子）⇒ 分片 403 ⇒ 无限自动重试，
+         * 用户看到的就是"重启后继续下载永远失败"。
+         */
+        val pageUrl: String = "",
     )
 
+    /**
+     * 下载任务表。
+     *
+     * ★★★ 第 344 轮（全量核查 · P0）：**独占 [lock]，不要再 synchronized(jobs)**。
+     *
+     * 原来这里有两把锁：本表的读写多数用 synchronized(jobs)，
+     * 而 runJob 的收尾（jobs.remove / failedJobs / autoRetryRounds）在 synchronized(lock) 里。
+     * 两个线程各抱一把锁、改同一个 LinkedHashMap —— enqueue 正在遍历 values 时，
+     * 另一个线程在另一把锁里 remove ⇒ **ConcurrentModificationException**。
+     * 而 enqueue 是被界面点「下载」直接调的、没有 runCatching，于是**点下载就闪退**。
+     *
+     * 现在全表统一到 lock 一把锁（本轮把那 14 处 synchronized(jobs) 全部改掉）。
+     */
     private val jobs = LinkedHashMap<Long, Job>()
 
     // ================= 任务持久化（LABPERSIST · 2026-10-31） =================
@@ -467,8 +489,16 @@ object HplayDownloads {
                         put("phase", t.phase)
                         put("doneBytes", t.doneBytes)
                         put("totalBytes", t.totalBytes)
+                        // ★★★ 第 344 轮（全量核查 · P1）：**pageUrl 必须存**。
+                        //
+                        // 它决定续传时的 Referer：[X99.refererFor] 拿到 pageUrl 就直接用它；
+                        // 拿不到就退回 lastDetailUrl（进程级、指向"屏幕上那条"）。
+                        // 重启后 lastDetailUrl 是空的或别的片子，分片请求就带着
+                        // 错误/空 Referer 去打 403，而重试用的是同一个错值 ——
+                        // 于是"重启后继续下载"永远失败，还无限自动重试。
+                        put("pageUrl", j.pageUrl)
                     }
-                }.take(30)
+                }
             }
             val arr = JSONArray()
             list.forEach { arr.put(it) }
@@ -504,9 +534,12 @@ object HplayDownloads {
                 val url = o.optString("url", "")
                 if (url.isBlank()) continue
                 val id = System.currentTimeMillis() + i
+                // ★ 第 344 轮：详情页地址（Referer 的依据）。老任务没有这个字段时退回 url。
+                val pageUrl0 = o.optString("pageUrl", "")
+                val pageUrl = pageUrl0.ifBlank { url }
                 val detail = HanimeDetail(
                     video = HanimeVideo(
-                        id = "", url = url,
+                        id = "", url = pageUrl,
                         title = o.optString("title", "未命名"),
                         thumb = "", duration = "", likes = "", views = "", brand = "",
                     ),
@@ -517,6 +550,8 @@ object HplayDownloads {
                     id = id, detail = detail, quality = o.optInt("quality", 0),
                     url = url, native = o.optBoolean("native", false),
                     group = o.optString("group", "未分组"),
+                    // Referer 依据（见 Job.pageUrl 的注释）
+                    pageUrl = pageUrl,
                 )
                 synchronized(lock) {
                     jobs[id] = j
@@ -742,7 +777,12 @@ object HplayDownloads {
      * 判据用「源页面 URL」而不是媒体直链：直链会过期、会换 CDN，
      * 而用户心里的"这一部片子"是那个页面 URL。
      */
-    fun enqueue(d0: HanimeDetail, quality: Int, url: String, group: String = "未分组"): Long = synchronized(jobs) {
+    fun enqueue(d0: HanimeDetail, quality: Int, url: String, group: String = "未分组"): Long = synchronized(lock) {
+        // ★ 第 334 轮：下载是全应用最耗资源、最容易出问题的动作，必须有日志。
+        com.han1me.log.AppLog.dl(
+            "enqueue",
+            d0.video.title.take(50) + " q=" + quality + " group=" + group + " url=" + url.take(80),
+        )
         // ★★★ 第 119 轮（用户报「肉视频下载分片 3 次仍失败：HTTP 401」）：**入队前重取详情**。
         //
         // 根因：板块详情页给出的 m3u8 里，分片 URL 带**签名**（肉视频实测形如
@@ -778,6 +818,9 @@ object HplayDownloads {
             id, d, quality, url,
             runCatching { X99.isNativeBoardUrl(d.video.url) }.getOrDefault(false),
             group.ifBlank { "未分组" },
+            // ★ 第 344 轮：把详情页地址带进 Job —— 它是续传 Referer 的唯一可靠依据，
+            // 也是重启恢复后还能正确带 Referer 的前提（见 Job.pageUrl 的注释）。
+            pageUrl = d.video.url,
         )
         _tasks.value = _tasks.value + DlTask(
             id = id, title = d.video.title.ifBlank { "媒体" }, quality = quality,
@@ -792,7 +835,8 @@ object HplayDownloads {
         id
     }
 
-    fun cancel(id: Long) = synchronized(jobs) {
+    fun cancel(id: Long) = synchronized(lock) {
+        com.han1me.log.AppLog.dl("cancel", "id=" + id)
         when (_tasks.value.firstOrNull { it.id == id }?.status) {
             DlStatus.QUEUED -> {
                 jobs.remove(id)
@@ -816,7 +860,8 @@ object HplayDownloads {
      * 语义：正在跑的把 token 置成"暂停"，当前分片读完就退出；排队中的直接标暂停。
      * **已经落盘的分片与 .part 都保留** —— 这就是"可续传"的前提。
      */
-    fun pause(id: Long) = synchronized(jobs) {
+    fun pause(id: Long) = synchronized(lock) {
+        com.han1me.log.AppLog.dl("pause", "id=" + id)
         when (_tasks.value.firstOrNull { it.id == id }?.status) {
             DlStatus.QUEUED -> {
                 paused.add(id)
@@ -869,7 +914,8 @@ object HplayDownloads {
      * **续传**：把暂停的任务重新排队。
      * 已经下好的分片会被 [pump] 的"落地即跳过"逻辑自动识别，不重下 —— 这是真续传。
      */
-    fun resume(id: Long) = synchronized(jobs) {
+    fun resume(id: Long) = synchronized(lock) {
+        com.han1me.log.AppLog.dl("resume", "id=" + id)
         if (!paused.remove(id)) return@synchronized
         cancelled.remove(id)
         // 任务对象还在（暂停时没有从 jobs 里删掉），直接改状态重排
@@ -882,7 +928,7 @@ object HplayDownloads {
     }
 
     /** 该任务当前是否处于暂停态。 */
-    fun isPaused(id: Long): Boolean = synchronized(jobs) { id in paused }
+    fun isPaused(id: Long): Boolean = synchronized(lock) { id in paused }
 
     /**
      * **全部暂停 / 全部继续**（第 57 轮，给通知栏的「暂停/继续」按钮用，照 1DM+）。
@@ -891,6 +937,7 @@ object HplayDownloads {
      * 与单个 [pause]/[resume] 共用同一套状态机，不另起一套。
      */
     fun pauseOrResumeAll() {
+        com.han1me.log.AppLog.dl("pauseOrResumeAll", "")
         val anyActive = tasks.value.any { it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED }
         if (anyActive) {
             tasks.value.filter { it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED }
@@ -902,13 +949,29 @@ object HplayDownloads {
 
     /** 取消所有未完成任务（界面上的「全部取消」）。 */
     fun cancelAll() {
-        synchronized(jobs) { _tasks.value.forEach { t -> if (t.status == DlStatus.QUEUED) jobs.remove(t.id) } }
+        com.han1me.log.AppLog.dl("cancelAll", "")
+        synchronized(lock) { _tasks.value.forEach { t -> if (t.status == DlStatus.QUEUED) jobs.remove(t.id) } }
         _tasks.value.filter { it.status == DlStatus.RUNNING }.forEach { cancel(it.id) }
     }
 
-    /** 清掉已完成/失败/取消的记录（不动磁盘文件）。 */
+    /**
+     * 清掉已完成/失败/取消的记录（不动磁盘文件）。
+     *
+     * ★★★ 第 344 轮（全量核查 · P1）：**不能把 PAUSED 一起清掉**。
+     *
+     * 原来的判据是「只留 RUNNING 或 QUEUED」，于是暂停中的任务也被删了。
+     * 而 UI 的「清空已完成」按钮只要有 DONE 记录就显示，用户点一下：
+     *   · 暂停的任务从列表里消失；
+     *   · 它的 jobs 条目也跟着断（resume 拿不到 Job，成了空操作）；
+     *   · 磁盘上的半成品还在，但界面上再也找不到，只能手动翻目录删。
+     * 现在只清真正终结的三态（DONE / FAILED / CANCELLED），
+     * PAUSED 必须留着 —— 那是用户还要继续的活。
+     */
     fun clearFinished() {
-        _tasks.value = _tasks.value.filter { it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED }
+        _tasks.value = _tasks.value.filter {
+            it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED ||
+                it.status == DlStatus.PAUSED
+        }
     }
 
     fun remove(id: Long) {
@@ -1798,7 +1861,7 @@ object HplayDownloads {
     private fun stopTasksWriting(target: File): Boolean {
         // target 已经过 itemRoot() 归一成条目根（目录或单文件），所以这里直接比前缀即可。
         val prefix = target.absolutePath
-        val hit = synchronized(jobs) {
+        val hit = synchronized(lock) {
             _tasks.value.filter { t ->
                 (t.status == DlStatus.RUNNING || t.status == DlStatus.QUEUED) &&
                     t.dest.isNotEmpty() && (t.dest == prefix || t.dest.startsWith(prefix + File.separator))
@@ -2283,15 +2346,31 @@ object HplayDownloads {
                 val pageUrl = v?.optString("pageUrl").orEmpty().ifBlank { v?.optString("url").orEmpty() }
                     .takeIf { it.startsWith("http") && !it.contains("vdownload.") && !it.contains(".mp4?") &&
                         !it.contains(".m3u8", true) }.orEmpty()
+                // ★★★ 第 340 轮重构（用户报「下载页面的封面补全功能形同虚设」）：
+                //
+                // 老实现只认 sidecar 里的 thumb，没有 thumb 就只尝试「pageUrl 重抓详情」，
+                // 而且 **重抓必须在 worker 里发网络请求**（每条约 1~3 s），6 路并发下 200 条要跑几分钟；
+                // 更糟的是节流键用的是 thumb —— thumb 为空时这条节流形同不存在，
+                // 每次点「补全封面」都把同一批必然失败的条目重跑一遍，用户看到的就是「点了没反应」。
+                //
+                // 现在三级线索一次排好，节流键统一用**锚点路径**（每条只试一次/小时）：
+                //   ① thumb（sidecar 记录的原图地址）—— 一次 HTTP 直取，最快；
+                //   ② pageUrl（真正的详情页）—— 重抓详情拿 thumb；
+                //   ③ srcUrl（源页面 URL）作为 pageUrl 的兜底（老 sidecar 没有 pageUrl 字段）。
+                // 三者都没有才算「无来源」，且如实计数。
+                val throttleKey = item.anchorPath.ifBlank { item.path }
+                val last = coverTriedAt[throttleKey] ?: 0L
+                if (!force && System.currentTimeMillis() - last < COVER_RETRY_INTERVAL) continue
+                coverTriedAt[throttleKey] = System.currentTimeMillis()
+                val srcUrl = item.srcUrl.takeIf {
+                    it.startsWith("http") && !it.contains(".m3u8", true) && !it.contains(".mp4?", true)
+                }.orEmpty()
+                val page2 = pageUrl.ifBlank { srcUrl }
                 when {
-                    thumb.isNotBlank() -> {
-                        val last = coverTriedAt[thumb] ?: 0L
-                        if (!force && System.currentTimeMillis() - last < COVER_RETRY_INTERVAL) continue
-                        coverTriedAt[thumb] = System.currentTimeMillis()
-                        tasks.add(CoverTask(item, thumb, pageUrl))
-                    }
-                    pageUrl.isNotBlank() -> tasks.add(CoverTask(item, "", pageUrl))
-                    else -> noSrc++   // thumb/pageUrl 均不可用：如实计无来源（这类条目的解析层本就没抓到封面 URL）
+                    thumb.isNotBlank() -> tasks.add(CoverTask(item, thumb, page2))
+                    page2.isNotBlank() -> tasks.add(CoverTask(item, "", page2))
+                    // 连页面地址都没有：仍排进队列，worker 里按标题去板块列表里找（最后一级救援）
+                    else -> tasks.add(CoverTask(item, "", ""))
                 }
             }
             if (tasks.isEmpty()) return CoverSweepReport(ok, noSrc, fail)
@@ -2316,6 +2395,12 @@ object HplayDownloads {
                                 X99.boardPage(HanimeVideo("", task.pageUrl, task.item.title, "", "", "", "", ""))
                             }.getOrNull()
                             thumb = refetched?.video?.thumb.orEmpty()
+                        }
+                        if (thumb.isBlank()) {
+                            // ★ 第 340 轮三级救援：连页面地址都没有（老 sidecar）时，
+                            // 拿标题去**已缓存的板块列表**里找同名条目 —— 纯内存、零网络。
+                            // 找到就用它的封面地址；找不到才如实计失败，不再「点了没反应」。
+                            thumb = runCatching { X99.findThumbByTitle(task.item.title) }.getOrDefault("")
                         }
                         var got = false
                         if (thumb.isNotBlank()) {
@@ -2545,9 +2630,30 @@ object HplayDownloads {
                 continue
             }
             // 没有可派的任务：看是否还有在跑的；没有就收工。
-            val alive = synchronized(jobs) { _tasks.value.any { it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED } }
+            //
+            // ★★★ 第 344 轮（全量核查 · P1）：**收工判据必须包含"已派发但还没起跑"**。
+            //
+            // 原来只看 _tasks 里有没有 RUNNING / QUEUED。但 runJob 一开始是先
+            // patch(RUNNING) 再干活，而 dispatched.add(id) 发生在**派发时**——
+            // 中间那段窗口里 _tasks 还是 QUEUED（会被算进 alive，没问题）；
+            // 真正的问题是相反方向：某个任务的 _tasks 已是 PAUSED/CANCELLED，
+            // 但它还在 ex 的线程队列里排着（dispatched 里有、池子满）——
+            // 这里判 alive=false → ex.shutdown() → 那个还没起跑的 runJob 被丢弃，
+            // 且 pool 已经 shutdown，下一次 enqueue 的 startWorkerLocked() 看到
+            // pool != null && !isShutdown 为 **false** 才重建 —— 这一步是对的，
+            // 但**已经 enqueue 进 _tasks 的那条任务没有派发者**了（新池子由下一次入队才建）
+            // ⇒ 它永远停在「排队中」。
+            //
+            // 现在：把 dispatched 也算进存活判据，并且**先置 pool=null 再 shutdown**，
+            // 让 startWorkerLocked 能可靠重建（否则下次入队看到旧池子还"没 shut"直接 return）。
+            val alive = synchronized(lock) {
+                dispatched.isNotEmpty() || _tasks.value.any {
+                    it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED
+                }
+            }
             if (!alive) {
                 runCatching { onQueueDrained?.invoke() }
+                synchronized(lock) { if (pool === ex) pool = null }
                 runCatching { ex.shutdown() }
                 return
             }
@@ -2557,7 +2663,7 @@ object HplayDownloads {
 
     private fun runJob(job: Job) {
         val prog = Prog().also { it.startedAt = System.currentTimeMillis() }
-        synchronized(jobs) { progs[job.id] = prog }
+        synchronized(lock) { progs[job.id] = prog }
         patch(job.id) { it.copy(status = DlStatus.RUNNING, phase = "取清单") }
         // ★ 第 261 轮：任务级自动重试（用户需求「遇到失败能一直重试下载到完成」）。
         // 旧实现失败即 FAILED 等手动重试；现在失败后在本循环里按轮退避自动重跑：
@@ -2595,7 +2701,7 @@ object HplayDownloads {
                     return
                 } catch (c: Cancelled) {
                     // 区分"用户暂停"与"用户取消"：前者要保留进度（可续传），后者才真的是取消。
-                    if (synchronized(jobs) { job.id in paused }) {
+                    if (synchronized(lock) { job.id in paused }) {
                         patch(job.id) { it.copy(status = DlStatus.PAUSED, phase = "已暂停", speedBps = 0.0) }
                     } else {
                         patch(job.id) { it.copy(status = DlStatus.CANCELLED, phase = "已取消", speedBps = 0.0) }
@@ -2620,7 +2726,7 @@ object HplayDownloads {
                     while (waited < wait) {
                         if (isCancelled(job.id)) {
                             // 等待期被取消/暂停：与传输期同语义（paused 在 ⇒ 暂停，否则取消）
-                            if (synchronized(jobs) { job.id in paused }) {
+                            if (synchronized(lock) { job.id in paused }) {
                                 patch(job.id) { it.copy(status = DlStatus.PAUSED, phase = "已暂停", speedBps = 0.0) }
                             } else {
                                 patch(job.id) { it.copy(status = DlStatus.CANCELLED, phase = "已取消", speedBps = 0.0) }
@@ -2650,7 +2756,7 @@ object HplayDownloads {
         }
     }
 
-    private fun isCancelled(id: Long) = synchronized(jobs) { id in cancelled }
+    private fun isCancelled(id: Long) = synchronized(lock) { id in cancelled }
 
     private fun transfer(job: Job): String {
         val url = job.url
@@ -2666,7 +2772,7 @@ object HplayDownloads {
         if (!maybePlaylist) return downloadProgressive(job, url)
 
         var eff = url
-        var text = fetchText(job.native, eff, job.detail.video.url)
+        var text = fetchText(job.native, eff, job.pageUrl)
         // master 清单：挑带宽最高的一档，回头再取一次真清单（与桌面版同一策略）
         if (text.contains("#EXT-X-STREAM-INF")) {
             val lines = text.lines()
@@ -2682,7 +2788,7 @@ object HplayDownloads {
             if (rel != null) {
                 eff = URI(url).resolve(rel).toString()
                 patch(job.id) { it.copy(phase = "取最高档清单") }
-                text = fetchText(job.native, eff, job.detail.video.url)
+                text = fetchText(job.native, eff, job.pageUrl)
             }
         }
         if (text.contains("#EXTM3U")) {
@@ -2748,7 +2854,7 @@ object HplayDownloads {
         var totalLen = -1L
         if (!job.native) {
             runCatching {
-                val rb = req(job.native, url, job.detail.video.url).header("Range", "bytes=0-0")
+                val rb = req(job.native, url, job.pageUrl).header("Range", "bytes=0-0")
                 mediaHttp.newCall(rb.get().build()).execute().use { resp ->
                     val cr = resp.header("Content-Range").orEmpty()
                     if (resp.code == 206 && cr.contains("/")) {
@@ -2801,7 +2907,7 @@ object HplayDownloads {
                     if (segHave > segLen) { runCatching { pf.delete() } }
                     val segFrom = from + (if (pf.exists()) pf.length() else 0L)
                     if (segFrom > from) done.addAndGet(pf.length())
-                    val rb = req(job.native, url, job.detail.video.url).header("Range", "bytes=" + segFrom + "-" + to)
+                    val rb = req(job.native, url, job.pageUrl).header("Range", "bytes=" + segFrom + "-" + to)
                     mediaHttp.newCall(rb.get().build()).execute().use { resp ->
                         if (resp.code != 206) throw IllegalStateException("分段 " + i + " 回 " + resp.code + "（非 206）")
                         val body = resp.body ?: throw IllegalStateException("分段 " + i + " 空响应")
@@ -2846,7 +2952,7 @@ object HplayDownloads {
             }
             // ③ 任何一步不行 -> 清干净，退回单连接（不产生半成品）
         }
-        pump(job.id, job.native, url, out, job.detail.video.url) { d, total, now ->
+        pump(job.id, job.native, url, out, job.pageUrl) { d, total, now ->
             prog.done.set(d)
             if (total >= 0) prog.total = total
             prog.bps = prog.speed(now, d)
@@ -2931,7 +3037,7 @@ object HplayDownloads {
                 val name = if (keyIdx == 0) "key.bin" else "key" + keyIdx + ".bin"
                 keyIdx++
                 patch(job.id) { it.copy(phase = "取密钥") }
-                pump(job.id, job.native, keyUrl, File(work, name), job.detail.video.url) { d, _t, now ->
+                pump(job.id, job.native, keyUrl, File(work, name), job.pageUrl) { d, _t, now ->
                     prog.done.addAndGet(d)
                     prog.bps = prog.speed(now, prog.done.get())
                     publish(job.id)
@@ -2944,7 +3050,7 @@ object HplayDownloads {
                 if (mapIdx == 0) initName = name
                 mapIdx++
                 patch(job.id) { it.copy(phase = "取初始化段") }
-                pump(job.id, job.native, mapUrl, File(work, name), job.detail.video.url) { d, _t, now ->
+                pump(job.id, job.native, mapUrl, File(work, name), job.pageUrl) { d, _t, now ->
                     prog.done.addAndGet(d)
                     prog.bps = prog.speed(now, prog.done.get())
                     publish(job.id)
@@ -2998,7 +3104,7 @@ object HplayDownloads {
                         // 多个分片线程同时推进度时会互相覆盖（实测 20 线程丢失 82%）。
                         // 改成按差值原子累加。
                         val last = java.util.concurrent.atomic.AtomicLong(0)
-                        pump(job.id, job.native, s.url, File(work, s.name), job.detail.video.url) { d, total, now ->
+                        pump(job.id, job.native, s.url, File(work, s.name), job.pageUrl) { d, total, now ->
                             prog.done.addAndGet(d - last.getAndSet(d))
                             prog.bps = prog.speed(now, prog.done.get())
                             val segBytes = if (total > 0) total.toDouble() else 1.0
@@ -3340,7 +3446,7 @@ object HplayDownloads {
 
     // ---------------------------------------------------------------- 状态发布
 
-    private fun progOf(id: Long): Prog = synchronized(jobs) {
+    private fun progOf(id: Long): Prog = synchronized(lock) {
         progs.getOrPut(id) { Prog().also { it.startedAt = System.currentTimeMillis() } }
     }
 
@@ -3353,10 +3459,25 @@ object HplayDownloads {
      * 现在把读-改-写整段放进 [lock]，成为一次原子操作。
      */
     private fun patch(id: Long, f: (DlTask) -> DlTask) {
+        // ★★★ 第 344 轮（全量核查 · P0）：**写回也必须在锁内**。
+        //
+        // 原来是这样：
+        //   val next = synchronized(lock) { _tasks.value.map { ... } }
+        //   _tasks.value = next          // ← 在锁外
+        //
+        // 注释里说"读-改-写整段放进 lock 成为一次原子操作"，但**写回那一步漏在锁外**。
+        // 16 个分片线程并发 patch 时：A 算出 nextA、B 算出 nextB（两者都基于同一份旧快照），
+        // A 先写、B 后写 ⇒ A 的更新整个丢失。真机上能复现的死循环是：
+        //   runJob 收尾 patch(DONE) 写完，某个还在跑的进度线程拿着旧快照 patch(RUNNING) 后写，
+        //   把状态覆盖回 RUNNING ⇒ 任务永远显示「下载中 100%」，前台服务不收工、
+        //   队列永远不空、通知栏一直挂着。
+        //
+        // 现在整段都在 lock 里（monitor 可重入，内部再 synchronized 也没问题）。
         val next = synchronized(lock) {
-            _tasks.value.map { if (it.id == id) f(it) else it }
+            val mapped = _tasks.value.map { if (it.id == id) f(it) else it }
+            _tasks.value = mapped
+            mapped
         }
-        _tasks.value = next
         // ★ LABPERSIST：状态变化即落盘（这是所有状态变更的统一入口，不会漏掉任何情况）。
         //
         // ★★★ 第 154 轮（真机日志：1738 行里绝大多数都是 persistTasks 刷屏，每 ~250ms 一条）：
@@ -3376,7 +3497,7 @@ object HplayDownloads {
 
     /** 把 prog 的计数快照到界面任务上（节流约 4 次/秒；收尾那一次一定发出去）。 */
     private fun publish(id: Long) {
-        val prog = synchronized(jobs) { progs[id] } ?: return
+        val prog = synchronized(lock) { progs[id] } ?: return
         val now = System.currentTimeMillis()
         val doneNow = prog.done.get()
         val finished = prog.total > 0 && doneNow >= prog.total

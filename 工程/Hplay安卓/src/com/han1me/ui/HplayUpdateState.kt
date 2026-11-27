@@ -37,7 +37,7 @@ object HplayUpdateState {
      *
      * 为什么需要它：开屏检查挂在 MainActivity 最外层，那个 composable 会随重组
      * 反复进入 LaunchedEffect。不设标记就会反复发请求 —— 匿名 GitHub 只有
-     * 60 次/小时，139 那边也有频率限制，几次重组就把额度耗光。
+     * 60 次/小时，几次重组就把额度耗光。
      *
      * 放这里而不是放 HplayStartupUpdate 内部的原因：Compose 的 remember 只在
      * 组合存活期间有效，而 MainActivity 的 Activity 重建（旋转、字体变化）会

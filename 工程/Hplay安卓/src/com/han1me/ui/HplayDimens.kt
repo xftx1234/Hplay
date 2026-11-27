@@ -50,6 +50,14 @@ object HplayDimens {
     /** 详情页封面高度。 */
     val heroHeight = 200.dp
 
+    /**
+     * 用户页封面横幅高度（第 337 轮）。
+     *
+     * 主线旧值是 150dp，但那是**通栏贴顶**的形态；本轮加了 MD3 圆角与页面边距，
+     * 160dp 才不至于因为上下各缩 16dp 显得比原来扁。
+     */
+    val coverHeight = 160.dp
+
     // ---------- 常用内边距 ----------
     val pagePadding = PaddingValues(horizontal = page)
     val cardPadding = PaddingValues(10.dp)

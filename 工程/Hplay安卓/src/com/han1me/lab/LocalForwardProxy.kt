@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * ## 生命周期
 
- * 由 [CfVerifyActivity] 在 onResume 起、onPause 停。端口动态分配（bind 0），
+ * 由 App 启动时起一次、进程存活期常驻（见 CfForward）。端口固定 18080，
  * 避免和别的进程抢固定端口。
  */
 class LocalForwardProxy(

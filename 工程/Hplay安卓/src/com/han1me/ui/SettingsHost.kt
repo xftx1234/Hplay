@@ -145,6 +145,13 @@ fun HplaySettingsHost(
             item {
                 com.han1me.tablet.HplayTabletSection()
             }
+            // ★★★ 第 334 轮（用户要求「数据板块没有日志，只有备份恢复」）：
+            // **运行日志面板**。上一版 AppLog 的开关是设置键 x99.log.enabled，
+            // 但全项目没有任何 UI 能改它 —— 日志系统写好了却永远打不开。
+            // 这一块就是那个缺失的入口：开关 / 过滤 / 实时查看 / 导出 / 清空。
+            item {
+                com.han1me.ui.HplayLogSection()
+            }
             item {
                 HplaySectionGroup("存储") {
                     Column(Modifier.padding(14.dp)) {

@@ -29,9 +29,8 @@ import org.json.JSONObject
  *
  * ## 与本项目既有两条通道的关系
  *
- * 139 与自建网盘是**主通道**（构建机直推，改动即时可见）；
- * GitHub 是**第二备用渠道**（用户原话「检查更新拿 github 作为备用渠道2」）。
- * 四条渠道在设置里可自由选，选哪条只查哪条，不做自动串联 ——
+ * 第 332 轮起 **GitHub 是默认渠道**（用户要求「改成 github 默认 + 自建垫底」）；
+ * 自建网盘是垫底通道。三条渠道在设置里可自由选，选哪条只查哪条，不做自动串联 ——
  * 串联会让「到底走的哪条」变得不可解释（参考项目里 Viewer 也刻意不串联，理由一样）。
  */
 object GitHubReleases {
@@ -45,6 +44,7 @@ object GitHubReleases {
      */
     private val http: OkHttpClient by lazy {
         OkHttpClient.Builder()
+            .addInterceptor(com.han1me.log.LoggingInterceptor)
             .proxy(java.net.Proxy.NO_PROXY)
             .connectTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
@@ -70,6 +70,8 @@ object GitHubReleases {
         val apkUrl: String,
         val apkName: String,
         val apkSize: Long,
+        /** asset 的 sha256（API 的 digest 字段）；空 = 站点没给。 */
+        val apkSha256: String = "",
         val prerelease: Boolean,
         val publishedAt: String,
         /** 从哪条路拿到的：api / atom。 */
@@ -87,7 +89,7 @@ object GitHubReleases {
     /**
      * 只允许一个检查在跑（与 [UpdateChecker] 同一套锁语义，含陈旧锁自愈）。
      *
-     * 两把锁分开：用户可能在设置里连点「GitHub」再点「139」，
+     * 两把锁分开：用户可能在设置里连点「GitHub」再点「自建网盘」，
      * 共用一把锁会让第二条被无谓地挡住。
      */
     private val busy = AtomicBoolean(false)
@@ -145,10 +147,50 @@ object GitHubReleases {
         else Result.Failed(Reason.NETWORK, e.message ?: e.javaClass.simpleName)
 
     private fun fromApi(repo: String, line: String, ci: Boolean): Result {
-        // CI 渠道要的是「列表里的第一条 ci-*」，正式版要的是 releases/latest。
-        // releases/latest 会跳过 prerelease 与 draft —— 正好是实验版需要的语义
-        // （实验版 Release 标 prerelease，所以 latest 不会把它当正式版）。
         if (!ci) {
+            // ★★★ 第 341 轮（真机实测：检查更新报 HTTP 404）：
+            //
+            // 原来一律走 /releases/latest。注释里写着「latest 跳过 prerelease 正好是实验版需要的语义」——
+            // **完全说反了**：GitHub 的 /releases/latest 定义就是「最新的**非**预发布、**非**草稿」，
+            // 而已实验版 Release 一律标 prerelease（见 HplayUpdateChannel 的说明与发布脚本），
+            // 于是实验版永远查不到，报 404「仓库或发布不存在」。
+            //
+            // 现在：**有本线前缀的 tag 就一定用列表接口**。列表接口不动预发布标记的语义，
+            // 反而能同时看到两条线，按前缀挑本线最新的那一条（按 published_at 排序）。
+            // latest 只留给「列表接口失败」的兜底。
+            val preferred = HplayUpdateChannel.tagPrefix(line)
+            val arr = runCatching { apiGetArray(API + repo + "/releases?per_page=30") }.getOrNull()
+            if (arr != null) {
+                var bestTag = ""
+                var bestAt = ""
+                for (i in 0 until arr.length()) {
+                    val j = arr.optJSONObject(i) ?: continue
+                    if (j.optBoolean("draft", false)) continue
+                    val tag = j.optString("tag_name").trim()
+                    if (tag.isEmpty() || !tag.startsWith(preferred)) continue
+                    // ci-* 是 CI 快照，不属于「这条线的正式发布」
+                    if (tag.startsWith("ci-")) continue
+                    val at = j.optString("published_at").ifBlank { j.optString("created_at") }
+                    if (bestTag.isEmpty() || at > bestAt) { bestTag = tag; bestAt = at }
+                }
+                if (bestTag.isNotEmpty()) {
+                    for (i in 0 until arr.length()) {
+                        val j = arr.optJSONObject(i) ?: continue
+                        if (j.optString("tag_name").trim() == bestTag) {
+                            return parseOne(j, repo, line, ci = false, via = "api")
+                        }
+                    }
+                }
+                // 列表里没有本线发布：如实报，不要落到 latest（那会给出另一条线的版本，害用户装错包）
+                if (arr.length() > 0) {
+                    return Result.Failed(
+                        Reason.NO_RELEASE,
+                        "仓库里没有「" + HplayUpdateChannel.lineLabel(line) +
+                            "」这条线的发布（该线 tag 前缀 " + preferred + "）。",
+                    )
+                }
+            }
+            // 列表接口整个失败（限额/网络）：退回 latest 兜底
             val j = apiGet(API + repo + "/releases/latest")
             return parseOne(j, repo, line, ci = false, via = "api")
         }
@@ -226,6 +268,7 @@ object GitHubReleases {
         var apkUrl = ""
         var apkName = ""
         var apkSize = 0L
+        var apkSha256 = ""
         if (assets != null) {
             var best: JSONObject? = null
             for (i in 0 until assets.length()) {
@@ -240,6 +283,11 @@ object GitHubReleases {
                 apkUrl = best.optString("browser_download_url")
                 apkName = best.optString("name")
                 apkSize = best.optLong("size", 0L)
+                // ★ 第 344 轮：GitHub API 的 asset 里有 digest 字段（形如 "sha256:ab12…"），
+                // 之前完全没读 —— 于是"下载完只能比体积"，GitHub 渠道的 md5 恒为空，
+                // 校验整块跳过，坏包直接交给安装器。这里把 sha256 取出来。
+                val dg = best.optString("digest")
+                if (dg.startsWith("sha256:")) apkSha256 = dg.removePrefix("sha256:")
             }
         }
         return Result.Ok(
@@ -251,6 +299,7 @@ object GitHubReleases {
                 apkUrl = apkUrl,
                 apkName = apkName,
                 apkSize = apkSize,
+                apkSha256 = apkSha256,
                 prerelease = j.optBoolean("prerelease", false),
                 publishedAt = j.optString("published_at").ifBlank { j.optString("created_at") },
                 via = via,
@@ -284,6 +333,8 @@ object GitHubReleases {
             } else {
                 val p = HplayUpdateChannel.tagPrefix(line)
                 if (!tag.startsWith(p)) continue
+                // ★ 第 341 轮：ci-* 是 CI 快照，不算「本线的正式发布」。
+                if (tag.startsWith("ci-")) continue
             }
             val title = unescapeXml(Regex("<title>(.*?)</title>", RegexOption.DOT_MATCHES_ALL).find(e)?.groupValues?.get(1).orEmpty())
             val body = unescapeXml(Regex("<content[^>]*>(.*?)</content>", RegexOption.DOT_MATCHES_ALL).find(e)?.groupValues?.get(1).orEmpty())

@@ -19,8 +19,37 @@ import androidx.compose.ui.Modifier
  *  - 无需宿主 jar 的 PlaybackSession（桌面内嵌播放器的要求），Android 版播放器自带会话。
  */
 class MainActivity : ComponentActivity() {
+    /**
+     * ★★★ 2026-11-26（第 338 轮 · 用户报「全屏播放用返回手势后停在横屏」）：
+     *
+     * 兜底回竖屏。播放器的横屏是 Activity.requestedOrientation = SENSOR_LANDSCAPE 设的，
+     * 系统不会因为"内容没了"就自己转回来 —— 安卓返回手势又常常绕过播放器的
+     * DisposableEffect（Compose 树在销毁路径上被拆，onDispose 未必跑到）。
+     *
+     * 这里只做一件事：**只要不是播放器锁着方向，就强制恢复系统默认**。
+     * 用 HplayOrientation.lockedBy() 判断，所以不会干扰：
+     *   · 播放器正在全屏（owner = "player"）
+     *   · 平板模式（走 HplayEnv 的另一条通道，不经过本对象）
+     */
+    private fun restoreOrientationIfNeeded() {
+        runCatching {
+            if (com.han1me.player.HplayOrientation.lockedBy() != null) return@runCatching
+            // ★★★ 第 345 轮：**播放器给了自动朝向基线时不抢方向**。
+            //
+            // 上面那条 lockedBy 只覆盖「全屏锁定」这一种情况。自动朝向（非全屏下按
+            // 视频朝向吸附）不设 owner —— 于是 onResume 会把刚吸好的方向打回
+            // UNSPECIFIED：从系统对话框 / 通知栏回来、切后台再回来，画面又翻回竖屏。
+            // 基线存在本身就说明「有活着的播放器在管方向」，这里直接让位。
+            if (com.han1me.player.HplayOrientation.hasAuto()) return@runCatching
+            if (requestedOrientation == android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) return@runCatching
+            requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            com.han1me.lab.LabLog.i("orient", "onResume 兜底：方向已交还系统")
+        }
+    }
+
     override fun onResume() {
         super.onResume()
+        restoreOrientationIfNeeded()
         // ★ 2026-11-25（第 303 轮）：从 WebView 登录页返回时强制同步登录态。
         //
         // LoginActivity 与 MainActivity 各自持有独立 Compose 组合树，
@@ -33,6 +62,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         HplayEnv.init(this, this)
+        // ★ 第 339 轮（用户要求「默认最高帧率可根据系统自动调节」）：探测面板上限，
+        // 只在动画期间提升，静止时交还系统（见 ui/HplayFrameRate.kt 的三层说明）。
+        com.han1me.ui.HplayFrameRate.init(this)
         // ★★ LABKEEP：恢复用户素材（封面/头像），防止换版本后丢失
         runCatching { HplayEnv.restoreSlots() }
         // ★★ 实验分叉（2026-10-30）：初始化内置节点（节点链接/开关/自动恢复）。
@@ -81,14 +113,13 @@ class MainActivity : ComponentActivity() {
                     // 设置页与 MainActivity 是两个独立 ComposeView，
                     // 各有自己的 Recomposer —— 跨视图的 mutableStateOf 传播不可靠。
                     // 这里每 200ms 主动检查一次，变化就触发本层重组。
-                    var pollTick by remember { mutableStateOf(0) }
-                    androidx.compose.runtime.LaunchedEffect(Unit) {
-                        while (true) {
-                            delay(200)
-                            if (com.han1me.ui.HplayUpdateState.visible) pollTick++
-                        }
-                    }
-                    pollTick
+                    // ★★★ 第 344 轮（全量核查 · P1）：**删掉 200ms 轮询**。
+                    //
+                    // 原来这里每 200ms 醒一次主线程探一个布尔量，理由是「跨 ComposeView 传播不可靠」。
+                    // 但 HplayUpdatePanel 与这一层是**同一个 setContent 组合树**（见下面几行），
+                    // 不存在跨 Recomposer 问题 —— 直接读 mutableState 就会正常重组。
+                    // 而这条循环换来的是：应用在前台期间每秒 5 次主线程唤醒，
+                    // 待机功耗与首屏帧率都受影响。
                     // ★★★ 2026-11-25（第 278 轮 UI 重构）：设置页覆盖层。
                     //
                     // 为什么挂在这里而不是塞进 Han1meApp.kt：
@@ -102,8 +133,27 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     if (com.han1me.ui.HplayUpdateState.visible) {
+                        // ★ 第 344 轮：**更新面板要有自己的返回键**。
+                        // 原来整个 update 包都没注册 BackHandler —— 面板开着按返回会冒泡到
+                        // Han1meApp 的根 handler，直接弹「退出确认」，面板反而不关。
+                        androidx.activity.compose.BackHandler {
+                            com.han1me.ui.HplayUpdateState.consume()
+                        }
                         com.han1me.update.HplayUpdatePanel(
                             onClose = { com.han1me.ui.HplayUpdateState.consume() },
+                        )
+                    }
+                    // ★ 第 332 轮：**引用与致谢全屏页**。
+                    //
+                    // 与更新面板同级（都在设置页之外这一层），所以它能盖住设置页，
+                    // 系统返回也能正常退出（下面有 BackHandler）。
+                    // 关于页里那一行「引用与致谢」只置 showCredits = true。
+                    if (com.han1me.ui.HplayAboutState.showCredits) {
+                        androidx.activity.compose.BackHandler {
+                            com.han1me.ui.HplayAboutState.showCredits = false
+                        }
+                        com.han1me.ui.AboutCreditsPage(
+                            onClose = { com.han1me.ui.HplayAboutState.showCredits = false },
                         )
                     }
                     // ★ 第 331 轮：**开屏自动检查更新弹窗**。

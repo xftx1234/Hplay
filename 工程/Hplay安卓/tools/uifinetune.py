@@ -55,16 +55,19 @@ def patch_top_nav(text: str) -> str:
         "            modifier = Modifier.weight(1f)," + chr(10) + ""
         "        ) {" + chr(10) + ""
         "            Row(" + chr(10) + ""
+        "        // ★ 第 345 轮（用户要求）：**去掉「搜索影片 / 演员」提示文字，只留一个居中的放大镜**。" + chr(10) + ""
+        "        // 原来那行 12sp 提示在 34dp 胶囊里基线偏下、和被压扁的 emoji 挤在一起，" + chr(10) + ""
+        "        // 真机看就是「小字样排版不对」。去掉文字后用 horizontalArrangement 居中，" + chr(10) + ""
+        "        // 否则图标会顶在左内边距上。" + chr(10) + ""
         "                verticalAlignment = Alignment.CenterVertically," + chr(10) + ""
+        "                horizontalArrangement = Arrangement.Center," + chr(10) + ""
         "                modifier = Modifier.weight(1f).height(34.dp)" + chr(10) + ""
         "                    .clip(RoundedCornerShape(17.dp))" + chr(10) + ""
         "                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)" + chr(10) + ""
         "                    .clickable { onSearchToggle?.invoke() }" + chr(10) + ""
         "                    .padding(horizontal = 12.dp)," + chr(10) + ""
         "            ) {" + chr(10) + ""
-        "                Text(\"🔍\", fontSize = 12.sp)" + chr(10) + ""
-        "                Spacer(Modifier.width(6.dp))" + chr(10) + ""
-        "                Text(\"搜索影片 / 演员\", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)" + chr(10) + ""
+        "                Text(\"\\uD83D\\uDD0D\", fontSize = 13.sp)" + chr(10) + ""
         "            }" + chr(10) + ""
         "            Spacer(Modifier.width(8.dp))" + chr(10) + ""
         "            Box(" + chr(10) + ""
@@ -752,7 +755,7 @@ def patch_update_listener(text: str) -> str:
 def patch_remove_dup_search_icon(text: str) -> str:
     """移除顶栏重复的搜索图标（第 307 轮）。
 
-    用户报「右上角搜索框多了一个🔍」。
+    用户报「右上角搜索框多了一个」。
     原因：patch_top_nav 加了搜索框 + 搜索按钮，
     而 TopNavBar 原本末尾还有一个 onSearchToggle?.let { ... } 的独立图标。
     两处都调 onSearchToggle，功能重复。
@@ -1544,6 +1547,14 @@ def patch_downloads_render(text: str) -> str:
     根因：showDownloads 只被设为 true，**没有任何地方渲染它**。
     （showSubs / showNotices 都有渲染块，唯独下载页漏了。）
     """
+    # ★★★ 第 344 轮（UI 全量核查 P0）：**已有带转场的一份就不再插第二份**。
+    #
+    # 原来这里无条件插一个 if (showDownloads) 块，
+    # 而 AnimatedContent 里早就有一份带 fade 转场的渲染，
+    # 结果同一个页面被画两次（各自持 listener、padding 还不同）：
+    # 互相盖、删一条另一份不刷新、进页高度跳变。
+    if "visible = showDownloads" in text:
+        return text
     anchor = "        if (showSubs) {"
     if anchor not in text:
         return text
@@ -2008,6 +2019,36 @@ def patch_list_responsive2(text: str) -> str:
         print('  [list] \u5217\u6570\u81ea\u9002\u5e94\u5df2\u63a5\u5165\uff08\u884c %d\uff09' % target)
     return chr(10).join(lines)
 
+def patch_fav_card_decode(text: str) -> str:
+    """第 340 轮：收藏页卡片封面按 480px 解码。
+
+    为什么放在这里而不是 postpatch：收藏页整段是 [patch_favtab_by_lines]
+    按行重写的，postpatch 在它**之前**跑，改完会被这里覆盖回去（实测）。
+    所以这条必须挂在最后一道。
+    """
+    old = (
+        "                                    com.han1me.web.HplayThumb(" + chr(10)
+        + "                                        url = item.thumb," + chr(10)
+        + "                                        contentDescription = item.title," + chr(10)
+        + "                                        modifier = Modifier.fillMaxSize()," + chr(10)
+        + "                                        contentScale = ContentScale.Crop," + chr(10)
+        + "                                    )"
+    )
+    new = (
+        "                                    // 第 340 轮：收藏页卡片按 480px 解码（96dp 高的图没必要 1000px）" + chr(10)
+        + "                                    com.han1me.web.HplayThumb(" + chr(10)
+        + "                                        url = item.thumb," + chr(10)
+        + "                                        contentDescription = item.title," + chr(10)
+        + "                                        modifier = Modifier.fillMaxSize()," + chr(10)
+        + "                                        contentScale = ContentScale.Crop," + chr(10)
+        + "                                        decodeMaxW = com.han1me.web.CARD_DECODE_W," + chr(10)
+        + "                                    )"
+    )
+    if old in text:
+        return text.replace(old, new, 1)
+    return text
+
+
 def main():
     f = GEN / "Han1meApp.kt"
     if not f.exists():
@@ -2049,6 +2090,8 @@ def main():
     patch_app_background(t)
     # ★ 第 322 轮：清掉旧板块残留（必须在所有补丁之后 —— 前面可能还有引用）
     t = strip_dead_functions(t, DEAD_FUNCTIONS)
+    # ★ 第 340 轮：收藏页封面解码宽度（必须在这之后 —— patch_favtab_by_lines 会重写该段）
+    t = patch_fav_card_decode(t)
     if t != t0:
         io.open(f, "w", encoding="utf-8").write(t)
         print("  UI 微调已应用")

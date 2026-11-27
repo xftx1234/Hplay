@@ -2,10 +2,11 @@ package com.han1me.lab
 
 import android.content.Context
 import android.content.Intent
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import okhttp3.Interceptor
 import okhttp3.Response
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 /**
  * **Cloudflare 质询拦截器**（2026-11-24 第 277 轮新增；2026-11-25 第 322 轮重写）。
@@ -98,33 +99,26 @@ class CloudflareInterceptor(
             LabLog.i("cf", "有 clearance 但重放仍被挑战，转静默挑战")
         }
 
-        // ---------- ② 静默 WebView 挑战（用户看不见） ----------
-        runCatching { com.han1me.log.AppLog.step("cf.CHALLENGE", url) }
-        LabLog.i("cf", "命中质询 " + request.url.host + request.url.encodedPath.take(50) + " -> 静默过盾")
-        if (SilentCfVerifier.run(url)) {
-            HplayCfHolder.startCooldown(host)
-            runCatching { HplayCfHolder.clearPool() }
-            val retry = runCatching { chain.proceed(CfCookieBridge.applyTo(request)) }.getOrNull()
-            if (retry != null && !isChallenge(retry)) {
-                LabLog.i("cf", "静默过盾成功，重放成功")
-                HplayCfHolder.markCleared(url)
-                return retry
-            }
-            runCatching { retry?.close() }
-            LabLog.i("cf", "静默过盾拿到 cookie 但重放仍被挑战")
-        }
-
-        // ---------- ③ 兜底：可见验证页（真需要人点的那种挑战） ----------
-        if (!runVerification(url)) {
-            LabLog.i("cf", "可见验证也未通过，原样返回 403")
-            return runCatching { chain.proceed(CfCookieBridge.applyTo(request)) }.getOrElse {
-                throw java.io.IOException("Cloudflare 质询未通过：" + url)
-            }
-        }
+        // ---------- ② 不再起 WebView，也不再弹窗（第 338 轮） ----------
+        //
+        // 用户要求：「默认不弹出，首页中间做一个 CF 验证按钮，点击后才弹出验证弹窗。」
+        //
+        // 322 轮在这里跑静默 WebView 挑战（1x1 透明 Dialog + 真 WebView），
+        // 有两个实测问题：
+        //   · 构造 WebView 要 200~600ms，而本方法跑在**拦截器线程**，
+        //     主线程此时正在组合首页 —— 两边互等，界面出现「卡一下」；
+        //   · 静默 12 秒仍失败就弹旧验证页，于是「首次启动弹窗」根本没消除。
+        //
+        // 现在拦截器只做一件事：**报告需要验证**，然后按现状返回 403。
+        // 界面层据此显示「需要验证」入口（首页中部的按钮），由用户主动点击触发
+        // [HplayGateActivity] —— 过盾 / 登录 / 取 cookie 在那里一次做完。
+        runCatching { com.han1me.log.AppLog.step("cf.NEED", url) }
+        LabLog.i("cf", "命中质询 " + host + " -> 标记待验证，交由首页按钮处理")
+        HplayCfHolder.markNeedVerify(host)
         HplayCfHolder.startCooldown(host)
-        runCatching { HplayCfHolder.clearPool() }
-        LabLog.i("cf", "可见验证通过，重放请求")
-        return chain.proceed(CfCookieBridge.applyTo(request))
+        return runCatching { chain.proceed(CfCookieBridge.applyTo(request)) }.getOrElse {
+            throw java.io.IOException("需要 Cloudflare 验证：" + url)
+        }
     }
 
     /** 判据与 Han1meViewer / Han1mePlus 一致：403 + `cf-mitigated: challenge`。 */
@@ -134,36 +128,6 @@ class CloudflareInterceptor(
         return mitigated.equals("challenge", ignoreCase = true)
     }
 
-    /** 起可见验证页并等待结果。 */
-    private fun runVerification(url: String): Boolean {
-        val latch = CountDownLatch(1)
-        CfVerifyActivity.onFinished = {
-            CfVerifyActivity.onFinished = null
-            latch.countDown()
-        }
-        val started = runCatching {
-            val i = Intent(context, CfVerifyActivity::class.java)
-            i.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            i.putExtra(CfVerifyActivity.EXTRA_URL, url)
-            context.startActivity(i)
-            true
-        }.getOrElse {
-            LabLog.i("cf", "验证页启动失败：" + it.javaClass.simpleName + " " + (it.message ?: ""))
-            false
-        }
-        if (!started) {
-            CfVerifyActivity.onFinished = null
-            return false
-        }
-        val ok = runCatching { latch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS) }.getOrDefault(false)
-        if (!ok) return false
-        return CfCookieBridge.hasPersisted() || HplayCfHolder.hasClearance(url)
-    }
-
-    companion object {
-        /** 等用户过盾的上限。太短来不及操作，太长会把请求线程吊死。 */
-        private const val TIMEOUT_SECONDS = 180L
-    }
 }
 
 /**
@@ -216,6 +180,40 @@ object HplayCfHolder {
         if (host.isBlank()) return
         cooldownAt[host] = System.currentTimeMillis()
         LabLog.i("cf", "进入冷却 " + (QUIET_MS / 1000) + " 秒：" + host)
+    }
+
+    /** 用户过完验证后立刻解除冷却（否则要白等 3 分钟才恢复）。 */
+    fun endCooldown(host: String) {
+        if (host.isBlank()) return
+        cooldownAt.remove(host)
+        LabLog.i("cf", "冷却已解除：" + host)
+    }
+
+    // ---------------- 待验证标记（第 338 轮） ----------------
+    //
+    // 拦截器不再自己弹窗，只把「这个 host 需要人来过一下验证」记下来。
+    // 首页据此显示入口按钮；用户点完 HplayGateActivity 后由它清除该标记。
+    // 用 Compose 可观察状态，界面无需轮询。
+    var needVerifyHost by mutableStateOf("")
+        private set
+
+    fun markNeedVerify(host: String) {
+        if (host.isBlank()) return
+        if (needVerifyHost == host) return
+        needVerifyHost = host
+        LabLog.i("cf", "标记待验证：" + host)
+    }
+
+    /** 是否当前确实需要用户去验证（首页据此决定要不要显示按钮）。 */
+    fun needsVerify(): Boolean = needVerifyHost.isNotBlank() && !hasPersistedClearance()
+
+    private fun hasPersistedClearance(): Boolean = CfCookieBridge.hasPersisted()
+
+    /** 验证完成后清除标记。 */
+    fun clearNeedVerify() {
+        if (needVerifyHost.isBlank()) return
+        needVerifyHost = ""
+        LabLog.i("cf", "待验证标记已清除")
     }
 
     fun inCooldown(host: String): Boolean {

@@ -39,13 +39,24 @@ object HplayBg {
         cached?.let { return it }
         if (tried) return null
         tried = true
-        // ★ 2026-11-25（第 294 轮）：改从 res/drawable 读。
-        // assets 方案在 Windows 构建机上反复被文件句柄卡住，换资源管线更稳。
         return runCatching {
-            val id = ctx.resources.getIdentifier("hplay_app_bg", "drawable", ctx.packageName)
-            if (id == 0) return null
-            BitmapFactory.decodeResource(ctx.resources, id)?.asImageBitmap()?.also { cached = it }
+            // ★ 第 335 轮（用户要求外观页自定义背景）：设置键 ui.bg.file 优先；
+            // 没有自定义图时回落包内 hplay_app_bg（第 335 轮已换成用户新图）。
+            val custom = com.han1me.X99.setting("ui.bg.file", "")
+            if (custom.isNotBlank()) {
+                com.han1me.HplaySlots.decodeImageCached(custom)?.also { cached = it }
+            } else {
+                val id = ctx.resources.getIdentifier("hplay_app_bg", "drawable", ctx.packageName)
+                if (id == 0) return null
+                BitmapFactory.decodeResource(ctx.resources, id)?.asImageBitmap()?.also { cached = it }
+            }
         }.getOrNull()
+    }
+
+    /** 用户换背景后调：丢缓存与 tried 标记，下一帧重新 load。 */
+    fun invalidate() {
+        cached = null
+        tried = false
     }
 }
 
@@ -64,19 +75,21 @@ fun HplayBackgroundLayer(
     val bmp = remember { HplayBg.load(ctx) }
     Box(modifier.fillMaxSize()) {
         if (bmp != null) {
-            // ★★★ 2026-11-25（第 310 轮 · 用户报「背景只有下面一半」）：
+            // ★★★ 第 335 轮修正（用户报「背景变成一半且拉伸」）：
             //
-            // 原因：图片是 912x1536 的**竖图**，用 ContentScale.Crop 铺到宽屏上时，
-            // 会按宽度缩放再裁掉上下 —— 视觉上就是「只有中间一条」。
+            // 上一版用 FillBounds（拉伸铺满），用户实测两处都不对：
+            //   · 拉伸把人物压变形；
+            //   · 旧默认图是 912x1536 竖图，铺宽屏后只看到中间一条。
             //
-            // 改法：用 ContentScale.FillBounds（拉伸铺满）。
-            // 竖图铺宽屏会被横向拉伸，但配合下面的深色遮罩后，
-            // 观感上比「只有一半」好得多；而且用户换横图时完全正常。
+            // 现在回到 **ContentScale.Crop**：等比缩放后裁边，**绝不拉伸**，
+            // 且 fillMaxSize() 保证**整屏覆盖**（顶栏到底栏，没有"一半"）。
+            // 配套：默认背景已换成 1536x912 的横图，Crop 在竖屏上就是"填满宽度、
+            // 上下各裁一点"，视觉最接近原图比例。
             Image(
                 bitmap = bmp,
                 contentDescription = null,
                 modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.FillBounds,
+                contentScale = ContentScale.Crop,
             )
         } else {
             // 没图时用深色渐变兜底，不至于白屏

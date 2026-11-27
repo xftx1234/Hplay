@@ -22,7 +22,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * 第 321 轮的做法是「等 1.5 秒再试一次」，但那时 CF 拦截器会弹可见验证页，
  * 而弹窗要人点，2 秒内不可能 —— 于是永远失败。
  *
- * 现在 CF 拦截器改成「静默 WebView 挑战」（[SilentCfVerifier]），
+ * 现在 CF 拦截器只做「标记待验证」，由首页的验证按钮走 [HplayGateActivity]，
  * 第一次 403 会自己把 clearance 拿回来再重放，所以这里**第一次就能拿到**。
  * 保留第二次重试作为兜底（静默挑战超时的情况下）。
  */

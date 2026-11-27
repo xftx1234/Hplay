@@ -64,38 +64,17 @@ object HplayEnv {
         // 而此时已经没有任何持有者会来解它。
         resetFullscreen()
         registerSlots(activity)
-        bindUpdateCredential()
     }
 
-    /**
-     * 把「检查更新」用的 139 凭据注入 [com.han1me.update.Yun139]。
-     *
-     * 优先级：**用户在设置里改过的值** > **构建期注入的** [com.han1me.update.Yun139Cred.AUTH]。
-     *  - 构建期那份来自 `tools/139_cred.txt`（**不入 git**，见 build.py 的 gen_yun139_credential）；
-     *  - 设置里那份让用户能在不重新打包的情况下换凭据（键 `yun139.authorization`）。
-     * 两处都为空时 [com.han1me.update.Yun139.fetchManifest] 会明确报「139 凭据不可用」，
-     * 界面**如实显示并回落到自建网盘通道** —— 不假装查过。
-     */
-    private fun bindUpdateCredential() {
-        runCatching {
-            val fromSetting = com.han1me.X99.setting(KEY_YUN139_AUTH, "")
-            com.han1me.update.Yun139.reset()          // 换凭据必须清路由缓存，否则会拿旧 host 打
-            // ★★ 第 114 轮：**多账号**。
-            //
-            // 旧版只注入**一个**凭据（Yun139Cred.AUTH）。它一旦过期（实测 route 接口回 05050006），
-            // 139 直连就永远失败 —— 用户每次检查更新都会看到「通道：自建网盘兜底」，
-            // 哪怕 139 本身好好的、只是 token 换过了。
-            // 现在注入**全部账号**（主账号 + 备用），Yun139 会逐个试到拿到清单为止。
-            // 用户在设置里手填的那份仍然**优先**（只用它，覆盖构建期注入的整份列表）。
-            com.han1me.update.Yun139.authorizations =
-                if (fromSetting.isNotBlank()) listOf(fromSetting)
-                else com.han1me.update.Yun139Cred.AUTHS
-            com.han1me.update.Yun139.authorization = com.han1me.update.Yun139.authorizations.firstOrNull().orEmpty()
-        }
-    }
-
-    /** 设置键：用户在面板里改的 139 凭据（覆盖构建期注入值）。 */
-    const val KEY_YUN139_AUTH = "yun139.authorization"
+    // ★★ 第 332 轮：**139 直连渠道整条删除**（用户要求「代码层也去掉」）。
+    //
+    // 原来这里有一个 bindUpdateCredential()：把构建期注入的 / 用户在设置里填的
+    // 139 Basic 凭据塞进 Yun139，供「检查更新」的 139 通道使用。
+    // 那个通道已经连同 Yun139.kt / Yun139Cred.kt 一起删掉了，凭据本身也不再需要 ——
+    // 而且它是公开分发版不能内嵌的东西（第 331 轮实测会被编进 classes*.dex）。
+    //
+    // 设置里若还留着旧键 yun139.authorization，现在没有任何读者，属于死数据。
+    // 不主动删：万一以后要恢复那条渠道，凭据还在；删了就得让用户重填。
 
     // ---------- 用户页本机素材槽（第 43 轮：填上游 HplaySlots 的两个空槽） ----------
 
@@ -289,8 +268,9 @@ object HplayEnv {
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
+        // ★ 第 344 轮：GRANT 标志要加在 chooser 上（只加在 send 上，收到的应用读不到 content://）
         val chooser = Intent.createChooser(send, "分享日志文件").apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         ctx.startActivity(chooser)
         true
@@ -311,11 +291,18 @@ object HplayEnv {
         // 原来直接 startActivity —— 系统里若有多个播放器，行为由默认关联决定，用户无从挑选；
         // 若一个都没有则抛 ActivityNotFoundException（runCatching 吞掉后只是静默失败）。
         // 现在：**用系统选择器列出本机所有能打开它的应用**，用户自己挑。
+        // ★★★ 第 344 轮（全量核查 · P1）：**GRANT 标志必须加在 chooser 上**。
+        //
+        // 原来只给 view 加了 FLAG_GRANT_READ_URI_PERMISSION，而真正 startActivity 的
+        // 是 chooser —— 权限授予只对"被启动的那个 intent"生效。于是目标播放器拿到
+        // content:// 后 openFileDescriptor 抛 SecurityException（部分 ROM 因系统自动
+        // 补授而侥幸可用，这正是「有的机器能用、有的不能」的原因）。
+        //
+        // EXTRA_INITIAL_INTENTS 还被塞了一个**空数组**：注释说要"授予最终被选中的应用"，
+        // 实际什么也没做。一并删掉。
         val chooser = Intent.createChooser(view, "选择播放方式").apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        // 先把临时读权限授予 chooser 里最终被选中的应用（否则对方拿到 URI 也读不到）
-        chooser.putExtra(Intent.EXTRA_INITIAL_INTENTS, arrayOf<android.content.Intent>())
         try {
             ctx.startActivity(chooser)
             true
@@ -425,8 +412,19 @@ object HplayEnv {
     var isFullscreen: Boolean by mutableStateOf(false)
         private set
 
-    fun toggleFullscreen(owner: FsOwner = FsOwner.PLAYER) =
-        applyFullscreen(!(isFullscreen && fsOwner == owner), owner = owner)
+    /**
+     * 切换全屏。
+     *
+     * @param landscape 进入全屏时是否要横屏。竖向素材传 false —— 强转横屏只会两边留大黑边。
+     *   ★ 第 338 轮：这个参数以前没暴露，于是播放器只能在外层先自己设一次方向
+     *   （与这里再设一次互相覆盖，真机表现为「点全屏不转屏」）。现在方向只由这里决定。
+     */
+    fun toggleFullscreen(landscape: Boolean = true, owner: FsOwner = FsOwner.PLAYER) =
+        applyFullscreen(
+            !(isFullscreen && fsOwner == owner),
+            landscape = landscape,
+            owner = owner,
+        )
 
     /**
      * landscape=false 用于竖向素材（强转横屏会两边留大黑边）。
@@ -450,9 +448,19 @@ object HplayEnv {
                 val a = activityRef?.get() ?: return@post
                 val w = a.window
                 if (on) {
-                    a.requestedOrientation =
-                        if (landscape) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                        else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    // ★★★ 第 338 轮：方向**只有一个来源**。
+                    //
+                    // 改之前这里有两处都在设 requestedOrientation：
+                    // HplayOrientation.enterFullscreen（SENSOR_LANDSCAPE / SENSOR_PORTRAIT）
+                    // 紧跟一行固定值（SENSOR_LANDSCAPE / PORTRAIT）——
+                    // 后者是"死方向"，竖向视频会被锁成 PORTRAIT 且不可翻转，
+                    // 而两者先后覆盖又让行为难以预测（真机实测全屏点下去不转屏）。
+                    //
+                    // 现在这里不再自己设方向，全部交给 HplayOrientation：
+                    // 它负责 SENSOR_* 语义、owner 仲裁与释放。
+                    com.han1me.player.HplayOrientation.enterFullscreen(
+                        a, portraitVideo = !landscape, who = "env-" + owner.name,
+                    )
                     w.decorView.systemUiVisibility =
                         (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                             or View.SYSTEM_UI_FLAG_FULLSCREEN
@@ -461,7 +469,8 @@ object HplayEnv {
                             or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                             or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
                 } else {
-                    a.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    // 同理：释放也只有一个来源
+                    com.han1me.player.HplayOrientation.release(a, "env-exit")
                     w.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 }
             }

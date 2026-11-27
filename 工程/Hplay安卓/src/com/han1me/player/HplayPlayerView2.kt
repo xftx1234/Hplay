@@ -4,8 +4,11 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -71,12 +74,28 @@ fun HplayPlayerView2(
     //   · 每次 visible 变 true，起一个「3.5 秒后隐藏」的协程
     //   · 用户任何操作 -> visible = true（重复设 true 也重启计时）
     //   · 用一个自增的 showSeq 作为 key，保证「已经 true 时再点」也能重启计时
+    // ★★★ 第 344 轮（播放链路审计 · P1）：**全屏时的返回键**。
+    //
+    // 旧播放器有 BackHandler(enabled = HplayEnv.isFullscreen)，重写成新播放器时丢了。
+    // 后果：全屏下按返回直接走 Han1meApp 根 handler（detail != null -> detail = null），
+    // 详情页被关掉、isFullscreen 残留 true、系统栏不恢复 —— 第 338 轮那个 bug 的回归。
+    androidx.activity.compose.BackHandler(enabled = com.han1me.HplayEnv.isFullscreen) {
+        com.han1me.HplayEnv.applyFullscreen(false)
+        onFullscreen?.invoke()
+    }
     var controlsVisible by remember { mutableStateOf(true) }
     var showSeq by remember { mutableStateOf(0) }
 
     // 每次 showSeq 或 visible 变化时重启隐藏计时
-    LaunchedEffect(showSeq, controlsVisible) {
+    LaunchedEffect(showSeq, controlsVisible, state.state) {
         if (!controlsVisible) return@LaunchedEffect
+        // ★ 第 344 轮：**暂停 / 播完时不自动隐藏**。
+        // 原来这里无条件 delay 3.5s 就隐藏 —— 而下面那个 LaunchedEffect(state.state)
+        // 在暂停时把它置 true 意在图「保持可见」，两个 effect 打架：
+        // 暂停后控制条自己消失，用户还得再点一下屏幕。
+        if (state.state == HplayPlayerState.PAUSED ||
+            state.state == HplayPlayerState.COMPLETED ||
+            state.state == HplayPlayerState.ERROR) return@LaunchedEffect
         delay(HplayPlayerDefaults.CONTROLS_HIDE_MS)
         controlsVisible = false
     }
@@ -95,75 +114,145 @@ fun HplayPlayerView2(
         }
     }
 
+    // ★ 第 341 轮：进入播放器读一次系统媒体音量（手势指示器要显示真实值）；
+    // 离开时把窗口亮度交还系统 —— 否则关掉播放器后屏幕会一直保持我们设的那个亮度。
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        com.han1me.HplayEnv.applicationOrNull()?.let { HplayPlayerVolume.readVolume(it) }
+        onDispose { HplayPlayerVolume.releaseBrightness() }
+    }
+
+    // ★★★ 第 344 轮（全量核查 · P1）：**退后台/锁屏必须暂停**。
+    //
+    // 这一条旧播放器（HplayPlayer.kt 第 304 行）有，重写成双层状态的新播放器时**丢了**：
+    //   DisposableEffect(controller, lifecycleOwner) { ON_STOP -> controller.pause() }
+    //
+    // 后果（真机可直接复现）：播放中按 Home 回桌面、或按电源键锁屏，
+    // 声音**继续播**，锁屏界面上一路出声；用户回来时进度已经跑掉几分钟。
+    // 也会和系统媒体会话、蓝牙耳机的焦点争夺打成一团。
+    //
+    // 这里用同一套 LifecycleEventObserver（不引额外依赖），
+    // 只认 ON_STOP —— ON_PAUSE 在弹系统对话框时也会触发，太激进。
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(controller, lifecycleOwner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_STOP) controller.pause()
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+
+    // ★★★ 第 345 轮（用户要求「竖版视频默认竖屏，横屏视频默认横屏」）：
+    //
+    // 尺寸一报出来就按视频朝向给默认屏幕方向。**必须放在这里**（不是全屏按钮里）：
+    // 用户要的是「进播放器就按素材朝向摆正」，而不是「点了全屏才转」。
+    // 两个参考源码都只在全屏里设方向（Viewer 的 enterFullscreen / Plus 的 _fullscreen），
+    // 所以这条是超出参考物、按用户明确要求加的 —— 逻辑集中在 HplayOrientation.setAuto，
+    // 它内部做「先吸附到天然朝向，600ms 后放开成 SENSOR 允许自由旋转」，
+    // 与本轮「旋转后保持原尺寸不填充」的要求配套（保比例在渲染层的 aspectRatio）。
+    androidx.compose.runtime.LaunchedEffect(state.videoWidth, state.videoHeight) {
+        if (state.videoWidth <= 0 || state.videoHeight <= 0) return@LaunchedEffect
+        com.han1me.player.HplayOrientation.setAuto(appCtx, state.isPortraitVideo)
+    }
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose { runCatching { com.han1me.player.HplayOrientation.releaseAuto(appCtx) } }
+    }
+
     Box(modifier.background(Color.Black)) {
         // ---------- 视频画面 ----------
         //
-        // ★ 2026-11-25（第 289 轮 · 真机验证后补）：**这里必须真的挂 PlayerView**。
+        // ★★★ 第 344 轮（全量核查 · P1）：**渲染层改成裸 TextureView**。
         //
-        // 初版只放了占位（想着"Surface 由外层提供"），真机跑出来是有声无画：
-        // 状态行显示「播放中 长235s 位5s」，但屏幕全黑 —— 因为没有任何 View
-        // 承接解码器输出的 Surface。PlayerView 就是那个承载体。
+        // 历史三段，每段都是真机换来的，别删：
+        //  ① 第 289 轮初版只放占位，真机「有声无画」——必须有 View 承接解码输出；
+        //  ② 第 291 轮改 PlayerView + 反射设 surfaceType=2，想切 TextureView；
+        //  ③ 第 344 轮复核发现 **② 从来没生效**，于是换掉 PlayerView。
         //
-        // 用 AndroidView 挂 PlayerView，并把它绑定到内核暴露的 ExoPlayer 实例。
-        androidx.compose.runtime.key(controller.uiState.hasMedia) {
-        androidx.compose.ui.viewinterop.AndroidView(
+        // 为什么 ② 是空的：media3-ui 1.4.1 的 PlayerView **没有 surfaceType 字段**
+        // （javap 实测只有 `private final View surfaceView`）。它只在构造函数里读
+        // XML 属性 R.styleable.PlayerView_surface_type，构造完就定死。
+        // 所以 getDeclaredField("surfaceType") 每次抛 NoSuchFieldException，
+        // 被 runCatching 吞掉 —— 实际一直是默认的 SurfaceView。
+        //
+        // 现在：自己 new TextureView，调 ExoPlayer 官方
+        // videoComponent.setVideoTextureView()，不碰任何私有字段。
+        // 参照 Han1meViewer/ui/player/surface/PlayerSurface.kt —— 它也是自写
+        // TextureView，且 onSurfaceTextureDestroyed 返回 false 保住纹理，
+        // 跨布局移动时画面不重建。我们只有一处播放器，但那半条同样有用：
+        // 控制条显隐、全屏切换都会改布局。
+        // ★★★ 第 345 轮（用户报「横版视频默认竖屏被拉伸变形，全屏横屏也被填充拉伸」）：
+        //
+        // 根因：TextureView 的布局是 Modifier.fillMaxSize() —— 容器多大它就多大，
+        // 而 ExoPlayer 往这个 surface 上做的是**拉伸铺满**（applyTransform 默认单位矩阵），
+        // 于是任何「容器比例 != 视频比例」的场合都变形：
+        //   · 竖屏手机里放横版视频（容器 9:19，视频 16:9）→ 横向压扁；
+        //   · 全屏横屏里放竖版视频（容器 19:9，视频 9:16）→ 横向拉宽；
+        //   · 详情页弹出的满窗浮层同理。
+        //
+        // 两个参考源码都不是这样做的：
+        //  · Han1meViewer `ui/player/video/HanimeVideoPlayer.kt` 第 349-366 行：
+        //    「直连 surface 不会自动 letterbox」，所以外面套一层
+        //    `Modifier.aspectRatio(videoRatio, matchHeightConstraintsFirst = videoRatio < 1f)`
+        //    并 Box 居中 —— 竖版视频优先按高度撑满，横版优先按宽度撑满。
+        //  · Han1mePlus `video_player_surface.dart` 第 404 行 auto 模式：
+        //    `Center(child: AspectRatio(aspectRatio: ratio, child: VideoPlayer))`。
+        //    另有 crop / stretch 两个可选模式，但**默认是 auto（contain）**。
+        //
+        // 我们照 auto（contain）做：视频按自身宽高比居中，多余区域是父层的黑底。
+        // 这样「原始尺寸不拉伸填充」「旋转后仍不填充」两条要求同时成立 ——
+        // 旋转只是换了容器尺寸，aspectRatio 每次都按新的约束重新解，
+        // 永远不会去填满（要填满得显式写 fillMaxSize，这里不再有）。
+        //
+        // matchHeightConstraintsFirst 的判据（照 Viewer）：
+        //   竖版视频（ratio < 1）→ true，先吃满可用高度再定宽度；
+        //   横版 / 方形 → false，先吃满可用宽度再定高度。
+        val vw = state.videoWidth
+        val vh = state.videoHeight
+        val videoRatio = if (vw > 0 && vh > 0) vw.toFloat() / vh.toFloat() else 0f
+        androidx.compose.foundation.layout.Box(
             modifier = Modifier.fillMaxSize(),
-            factory = { ctx ->
-                androidx.media3.ui.PlayerView(ctx).apply {
-                    useController = false          // 控制条我们自己做，不用它自带的
-                    resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
-                    setBackgroundColor(android.graphics.Color.BLACK)
-                    keepScreenOn = true
-                    // ★★★ 2026-11-25（第 295 轮 · 用户报"有声音没画面"）：
-                    //
-                    // **必须用 TextureView，不能用默认的 SurfaceView。**
-                    //
-                    // 症状（用户实测）：播放时有声音、进度在走，但画面黑；
-                    // 有时又正常 —— 取决于 Surface 有没有被重新创建。
-                    //
-                    // 根因：PlayerView 默认 player.setVideoSurfaceType(SURFACE_TYPE_SURFACE_VIEW)。
-                    // SurfaceView 的 Surface 由 WindowManager 单独管理，**不在 View 层级里绘制**。
-                    // 它的已知问题：
-                    //   · 布局变化 / 视图复用 / 切换 Activity 时 Surface 会被销毁重建，
-                    //     而 ExoPlayer 的 output surface 不会自动跟进 -> 黑屏但有声
-                    //   · 动画 / transform / alpha 对它无效（我们看到的就是"黑块"）
-                    //   · 与 Compose 的 AndroidView 组合时更明显（AndroidView 会复用 View）
-                    //
-                    // 参考项目的做法（Han1meViewer/ui/player/surface/PlayerSurface.kt 第 36 行）：
-                    //   用的是 TextureView，并注释说明「跨布局移动时复用同一个实例，播放不中断」。
-                    //
-                    // TextureView 是普通 View，走正常绘制管线，布局变化不会丢 Surface。
-                    // 代价是性能略低于 SurfaceView（多一次 GPU 拷贝），但 1080p 完全够。
-                    setShutterBackgroundColor(android.graphics.Color.BLACK)
-                    // media3 1.4.1 没有公开的 setSurfaceType（那是 1.5 才加的），
-                    // 但 PlayerView 内部有个 private 的 surface_type 字段。
-                    // 用 XML 属性那条路：inflate 时读 R.styleable.PlayerView_surface_type。
-                    // 这里直接反射设字段，语义与 1.5 的 setSurfaceType 一致。
-                    runCatching {
-                        val fld = androidx.media3.ui.PlayerView::class.java
-                            .getDeclaredField("surfaceType")
-                        fld.isAccessible = true
-                        fld.setInt(this, 2)   // 2 = SURFACE_TYPE_TEXTURE_VIEW
-                    }
-                }
-            },
-            // ★ 真机第二次修正：**必须在 hasMedia 变化时重新绑定**。
-            //
-            // 内核是懒建的（第一次 prepare 才创建 ExoPlayer），而 AndroidView 的
-            // factory 在首次组合时就跑了 —— 那一刻 rawExoPlayer() 还是 null，
-            // 于是 pv.player 没设上，之后 update 也不一定再触发（state 引用没变）。
-            // 结果就是"有声无画"：进度在走、状态行正常，但 Surface 没绑定。
-            //
-            // 用 key(...) 把整个 AndroidView 绑到「内核实例是否已就绪」上，
-            // 就绪后强制重建并绑定。
-            update = { pv ->
-                val raw = controller.rawExoPlayer()
-                if (raw != null && pv.player !== raw) {
-                    pv.player = raw
-                    android.util.Log.i("hplay.player", "PlayerView 已绑定 ExoPlayer")
-                }
-            },
-        )
+            contentAlignment = Alignment.Center,
+        ) {
+            androidx.compose.runtime.key(controller.uiState.hasMedia) {
+                androidx.compose.ui.viewinterop.AndroidView(
+                    modifier = if (videoRatio > 0f) {
+                        Modifier.aspectRatio(
+                            videoRatio,
+                            matchHeightConstraintsFirst = videoRatio < 1f,
+                        )
+                    } else {
+                        // 尺寸未知（还没 prepare 完）：先铺满，避免首帧闪一下小方块。
+                        // 一旦 onVideoSizeChanged 报出真实宽高，上面那个分支立刻接管。
+                        Modifier.fillMaxSize()
+                    },
+                    factory = { ctx ->
+                        android.view.TextureView(ctx).apply {
+                            // ★ 第 344 轮：原来 keepScreenOn 设在 PlayerView 上，换成 TextureView
+                            // 之后要跟过来 —— 否则看片时屏幕会按系统超时熄灭
+                            // （用户报过「看到一半黑屏」，根因就在这里）。
+                            keepScreenOn = true
+                            // 纹理不能在 detach 时被回收，否则回来是黑帧，
+                            // 要等下一个关键帧才恢复（真机表现为「切全屏黑一下」）。
+                            surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
+                                override fun onSurfaceTextureAvailable(
+                                    st: android.graphics.SurfaceTexture, w: Int, h: Int,
+                                ) {
+                                    controller.attachTextureView(this@apply)
+                                }
+                                override fun onSurfaceTextureSizeChanged(
+                                    st: android.graphics.SurfaceTexture, w: Int, h: Int,
+                                ) = Unit
+                                override fun onSurfaceTextureDestroyed(
+                                    st: android.graphics.SurfaceTexture,
+                                ): Boolean = false
+                                override fun onSurfaceTextureUpdated(st: android.graphics.SurfaceTexture) = Unit
+                            }
+                        }
+                    },
+                    // 纹理可能先就绪，也可能内核后建（懒建）。update 每帧都跑，
+                    // 这里做幂等挂载：同一实例不重复挂（内部有 lastTexture 判断）。
+                    update = { tv -> controller.attachTextureView(tv) },
+                )
+            }
         }
         // 封面（起播前/出错时垫底）
         if (state.posterUrl != null && !state.hasMedia) {
@@ -199,12 +288,49 @@ fun HplayPlayerView2(
                 showControls()
             },
             onUnlock = { controller.setGestureLocked(false) },
+            // ★ 第 341 轮：纵向手势的**真实**落点（之前是空实现，只画数字）。
+            onVolumeDelta = { steps ->
+                val c = com.han1me.HplayEnv.applicationOrNull()
+                if (c != null) HplayPlayerVolume.adjustVolume(c, steps)
+            },
+            onBrightnessDelta = { d ->
+                val c = com.han1me.HplayEnv.applicationOrNull()
+                if (c != null) HplayPlayerVolume.adjustBrightness(c, d)
+            },
         );
+
+        // ---------- 锁定态：只剩一个解锁按钮 ----------
+        //
+        // ★ 第 344 轮（全量核查 · P1）：手势锁定原来**是个死功能**。
+        //   · 没有任何地方调 setGestureLocked(true)（全项目只有传 false 的那一处）；
+        //   · 即便锁上了，锁定态单击走的是 onTap（切一个看不见的控制条），
+        //     而 onUnlock 这个参数从头到尾没有被调用 —— 锁上就出不来了。
+        // 现在补齐三件：顶栏的锁按钮（锁上）、这里的解锁按钮（打开）、
+        // 以及 gesture 层锁定态单击 → onUnlock。
+        if (state.isGestureLocked) {
+            Box(
+                Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = 14.dp)
+                    .size(40.dp)
+                    .clip(androidx.compose.foundation.shape.CircleShape)
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .clickable {
+                        controller.setGestureLocked(false)
+                        showControls()
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("🔓", fontSize = 17.sp)
+            }
+        }
 
         // ---------- 顶部控制条 ----------
         HplayPlayerTopBar(
             state = state,
-            visible = controlsVisible,
+            // 锁定后控制条一律不画（否则锁定毫无意义 —— 一碰就全出来了）
+            visible = controlsVisible && !state.isGestureLocked,
+            onLock = { controller.setGestureLocked(true) },
             onBack = { onBackClick?.invoke() },
             onSpeedClick = {
                 val next = (state.speedIndex + 1) % HplayPlayerDefaults.SPEEDS.size
@@ -218,18 +344,22 @@ fun HplayPlayerView2(
         HplayPlayerBottomBar(
             state = state,
             progress = progress,
-            visible = controlsVisible,
+            visible = controlsVisible && !state.isGestureLocked,
             onSeek = { ms -> controller.seekTo(ms); showControls() },
             onPlayPause = { controller.togglePlayPause(); showControls() },
             onFullscreen = {
-                // ★ 2026-11-25（第 305 轮）：**真的调 Activity.requestedOrientation**。
-                // 之前只改 Compose 标记，系统根本不知道要转屏 —— 点了没反应。
-                com.han1me.player.HplayOrientation.toggle(
-                    ctx = appCtx,
-                    portraitVideo = state.isPortraitVideo,
-                    currentlyFullscreen = com.han1me.HplayEnv.isFullscreen,
+                // ★★★ 第 338 轮：**只走 HplayEnv 一条路**。
+                //
+                // 原来这里先 HplayOrientation.toggle（按视频朝向设 SENSOR_LANDSCAPE/PORTRAIT），
+                // 再 HplayEnv.toggleFullscreen（内部又设一次方向）—— 两次设置互相覆盖，
+                // 而且第一次用的是 state.isPortraitVideo、第二次用的是 landscape 参数，
+                // 两者不一致时（竖屏视频）就被锁成竖屏，表现为「点全屏不转屏」。
+                //
+                // 现在 HplayEnv.applyFullscreen 内部统一 → HplayOrientation，
+                // 方向只有一个来源。这里只负责驱动状态与通知宿主。
+                com.han1me.HplayEnv.toggleFullscreen(
+                    landscape = !state.isPortraitVideo,
                 )
-                com.han1me.HplayEnv.toggleFullscreen()
                 onFullscreen?.invoke()
                 showControls()
             },
@@ -252,7 +382,10 @@ fun HplayPlayerView2(
             }
         }
 
-        // ---------- 错误提示 ----------
+        // ---------- 错误提示 + 重试 ----------
+        //
+        // ★ 第 344 轮：原来只有一行红字，**没有重试按钮** ——
+        // 网络抖一下就播不了，只能退出去再点进来（旧播放器是有重试的，重写时丢了）。
         if (controller.errorText.isNotEmpty()) {
             Box(
                 Modifier.align(Alignment.Center)
@@ -261,11 +394,29 @@ fun HplayPlayerView2(
                     .background(Color.Black.copy(alpha = 0.78f))
                     .padding(16.dp),
             ) {
-                Text(
-                    controller.errorText,
-                    color = HplayErrorSoft,
-                    fontSize = 12.sp,
-                )
+                androidx.compose.foundation.layout.Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        controller.errorText,
+                        color = HplayErrorSoft,
+                        fontSize = 12.sp,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "重试",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.primary)
+                            .clickable {
+                                controller.retry()
+                                showControls()
+                            }
+                            .padding(horizontal = 18.dp, vertical = 7.dp),
+                    )
+                }
             }
         }
 

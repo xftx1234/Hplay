@@ -113,6 +113,10 @@ class HplayExoKernel(
             return if (d == C.TIME_UNSET || d < 0) 0L else d
         }
 
+    /** 已缓冲占比（ExoPlayer 的 bufferedPercentage 已经归一到 0..100）。 */
+    override val bufferedPercent: Int
+        get() = player?.bufferedPercentage?.coerceIn(0, 100) ?: 0
+
     /**
      * 准备媒体。
      *
@@ -210,6 +214,29 @@ class HplayExoKernel(
             )
             .build()
 
+        // ★★★ 第 344 轮（全量核查 · P1）：**音频焦点 + 拔耳机即暂停**。
+        //
+        // 这两条原来一条都没有（全项目 grep setAudioAttributes 为 0）：
+        //
+        //  ① **没有音频属性** ⇒ ExoPlayer 不知道自己在放"媒体"，于是：
+        //     · 申请不到音频焦点 —— 来电、微信语音、另一个播放器一开声，两边**同时响**；
+        //     · 系统媒体会话/锁屏控制/蓝牙耳机按键拿不到它，耳机上按暂停没反应；
+        //     · 系统音量键偶尔调的不是媒体音量（取决于当前焦点归属）。
+        //     ExoPlayer.setAudioAttributes(attrs, handleAudioFocus = true) 会自动
+        //     完成 requestAudioFocus / abandon，并在被抢占时按系统建议暂停或压低。
+        //
+        //  ② **没有 becoming-noisy 处理** ⇒ **拔掉耳机瞬间外放**。
+        //     这是最能让人社死的一条，Android 官方要求 AudioManager.ACTION_AUDIO_BECOMING_NOISY
+        //     上必须暂停。这里用 setHandleAudioBecomingNoisy(true)，ExoPlayer 内部代管。
+        p.setAudioAttributes(
+            androidx.media3.common.AudioAttributes.Builder()
+                .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+                .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build(),
+            /* handleAudioFocus = */ true,
+        )
+        p.setHandleAudioBecomingNoisy(true)
+
         p.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 when (state) {
@@ -285,6 +312,20 @@ class HplayExoKernel(
         // ---- Referer：按本次播放下发（官方源留空）----
         val ref = when {
             localFile -> ""
+            // ★★★ 第 344 轮（播放链路审计 · P0）：**糖心的 Referer 走了错来源**。
+            //
+            // X99.refererFor 依赖进程级的 lastDetailUrl / nativeMediaHosts，
+            // 而这两个值由各板块的 *Detail() 在「界面上采纳某条详情」时登记。
+            // 糖心（TxBoard）的详情是**纯本地合成**的 —— 不发请求、不调 openNativeDetail，
+            // 于是那两个全局值里躺的是上一条别的板块的详情，Referer 全错。
+            // 而糖心 m3u8 必须带 tangxinvlog.app 的 Referer（TxBoard.kt 实测记录）。
+            // 结果就是糖心整板块点播放全黑 / 报错。
+            //
+            // TxBoard.refererFor 早就写好了（判 isCdnUrl -> HOME），但全项目零调用者。
+            // 判 CDN 域而不是页面域：播放时 url 是 t.5gcdn.xyz 的媒体地址，
+            // isTxUrl 判的是 tangxinvlog.app（页面域），对它恒为 false。
+            nativeBoard && runCatching { com.han1me.tx.TxBoard.isCdnUrl(url) }.getOrDefault(false) ->
+                runCatching { com.han1me.tx.TxBoard.refererFor(url) }.getOrDefault("")
             nativeBoard -> runCatching { com.han1me.X99.refererFor(url) }.getOrDefault("")
             else -> runCatching { com.han1me.X99.mirrorRefererFor(url) }.getOrDefault("")
         }

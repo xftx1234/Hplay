@@ -107,12 +107,13 @@
             </intent-filter>
         </activity>
 
-        <!-- ★ 2026-11-24（第 277 轮 · CF 质询）：Cloudflare 验证页。
-             独立 Activity 是刻意的 —— 它只在被盾拦住时临时弹出，
-             用完即走；混进主 Compose 导航反而要为一棵极小的界面引入路由负担。
-             不导出（exported=false）：只允许本应用内部启动。 -->
+        <!-- ★ 2026-11-26（第 338 轮 · 用户要求）：**验证 + 登录 + 取 cookie 一体页**。
+             取代原来的两条路（旧验证页只过盾 / LoginActivity 只登录）——
+             （第 340 轮：旧验证页 CfVerifyActivity 已确认为死代码并删除，见 工程记录。）
+             用户明确要求「过验证，登录，取 cookie，一次全部解决，不再二次需要」。
+             单独一个 Activity 的理由同下面两条：极短生命周期、用完即走。 -->
         <activity
-            android:name="com.han1me.lab.CfVerifyActivity"
+            android:name="com.han1me.lab.HplayGateActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|fontScale|locale|layoutDirection|uiMode"
             android:exported="false"
             android:launchMode="singleInstance"

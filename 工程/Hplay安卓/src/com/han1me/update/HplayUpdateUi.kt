@@ -58,7 +58,7 @@ import com.han1me.HplayWarning
  *
  * 于是这个面板顶部有两排选择器：
  *  · **发布线**：实验版（lab）/ 主线版（stable）
- *  · **渠道**：移动云盘 139 / 自建网盘 / GitHub Releases / GitHub CI 构建
+ *  · **渠道**：GitHub Releases（默认）/ GitHub CI 构建 / 自建网盘（垫底）
  *
  * 两者都是**用户选择持久化**的（存在 X99 设置里），重装前一直有效。
  * 用户可以先在实验版里把线切到主线版、直接下主线的新包覆盖上去 —— 因为两条线
@@ -66,7 +66,7 @@ import com.han1me.HplayWarning
  *
  * ## 下载方式也改了
  *
- * 旧版：取一次 139/网盘的签名直链，**交给系统浏览器**去下（签名 15 分钟有效）。
+ * 旧版：取一次网盘的签名直链，**交给系统浏览器**去下（签名 15 分钟有效）。
  * 新版：同一个按钮，但**在应用内后台下载**（[UpdateService] 前台服务 + 通知栏进度），
  * 下完自动拉起系统安装器（[ApkInstaller]）。
  *
@@ -94,7 +94,7 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
     // ★ 第 331 轮：渠道与发布线（用户选择，持久化）。
     var line by remember { mutableStateOf(HplayUpdateChannel.line) }
     var channel by remember { mutableStateOf(HplayUpdateChannel.channel) }
-    // 换线 / 换渠道后旧结果作废 —— 否则界面上「当前查的是 139」却显示 GitHub 的版本号。
+    // 换线 / 换渠道后旧结果作废 —— 否则界面上「当前查的是网盘」却显示 GitHub 的版本号。
     var pickerVersion by remember { mutableStateOf(0) }
 
     // 下载进度：每 400ms 轮询一次 UpdateService.State（它不在 Compose 快照里）。
@@ -247,10 +247,10 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
         }
         Text(
             when (channel) {
-                HplayUpdateChannel.CH_YUN139 -> "移动云盘 139 直连：公网可达，出门也能查。构建机每次发版自动推送。"
-                HplayUpdateChannel.CH_NETDISK -> "自建网盘：家里的服务（4 个挂载目录轮询），只有在家最稳。"
-                HplayUpdateChannel.CH_GITHUB -> "GitHub Releases：本线的正式发布。国内可能需要网络条件。"
-                else -> "GitHub CI 构建：最新一次 CI 打出来的预发布包，比正式版更超前，也更可能有问题。"
+                HplayUpdateChannel.CH_GITHUB -> "GitHub Releases：本线的正式发布。不需要任何凭据，公网匿名可读。"
+                HplayUpdateChannel.CH_CI ->
+                    "GitHub CI 构建：最新一次 CI 打出来的预发布包，比正式版更超前，也更可能有问题。"
+                else -> "自建网盘（垫底）：4 个挂载目录轮询。GitHub 与 CI 都不通时才该用它。"
             },
             color = TextFaint, fontSize = 10.5.sp, lineHeight = 15.sp,
             modifier = Modifier.padding(bottom = 10.dp),
@@ -273,7 +273,8 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
         when (val r = result) {
             null -> {
                 Text(
-                    if (checking) "正在取最新构建版本（移动云盘 139 直连，网盘兜底）…" else "点右上角「重新检查」开始。",
+                    if (checking) "正在取最新构建版本（走「" + HplayUpdateChannel.channelLabel(channel) + "」）…"
+                    else "点右上角「重新检查」开始。",
                     color = TextFaint, fontSize = 12.sp, lineHeight = 18.sp,
                 )
             }
@@ -291,9 +292,6 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
                         Spacer(Modifier.height(5.dp))
                         Text(
                             when (channel) {
-                                HplayUpdateChannel.CH_YUN139 ->
-                                    "这条路会先试 139 直连、再试 4 个网盘挂载目录。" +
-                                        "常见原因：139 凭据没配/失效、网盘服务没在跑、或这一版还没推上去。"
                                 HplayUpdateChannel.CH_NETDISK ->
                                     "这条路轮询 4 个挂载目录（移动云盘134→195→天翼→123）。" +
                                         "常见原因：服务没起、域名解析不了、或这一版还没推上去。"
@@ -323,7 +321,6 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
                         Spacer(Modifier.height(3.dp))
                         Text(
                             when (r.via) {
-                                UpdateChecker.Via.YUN139 -> "移动云盘139：v${rem.versionName}"
                                 UpdateChecker.Via.NETDISK -> "网盘：v${rem.versionName}"
                                 UpdateChecker.Via.GITHUB -> "GitHub：${rem.ghTag.ifBlank { "v" + rem.versionName }}"
                                 UpdateChecker.Via.CI -> "GitHub CI：${rem.ghTag}"
@@ -333,8 +330,7 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
                         Spacer(Modifier.height(3.dp))
                         Text(
                             when (r.via) {
-                                UpdateChecker.Via.YUN139 -> "通道：移动云盘 139 直连（公网可用，出门也能检查）"
-                                UpdateChecker.Via.NETDISK -> "通道：自建网盘兜底（139 不可用时才会走这条）"
+                                UpdateChecker.Via.NETDISK -> "通道：自建网盘（垫底；GitHub 不通时才走这条）"
                                 UpdateChecker.Via.GITHUB -> "通道：GitHub Releases · ${HplayUpdateChannel.lineLabel(line)}"
                                 UpdateChecker.Via.CI -> "通道：GitHub CI 构建（预发布，追新用）"
                             },
@@ -360,9 +356,14 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
 
                     // ---------- ① 应用内后台下载（第 331 轮主路径）----------
                     // 有进度在跑时按钮变成「取消」，避免用户重复点出第二个下载。
+                    // ★★★ 第 344 轮（用户报「点击按钮指向残留的上一版本安装包」）：
+                    //   pendingApk 必须按**本次查到的版本号**去找，不能只判"文件存在"。
+                    //   原来固定文件名 + 无版本判断 ⇒ 摸到旧包就直接拉安装器，
+                    //   用户永远装不上新版，还以为更新成功了。
+                    val pending = UpdateService.pendingApk(ctx, rem.versionName)
                     val btnText = when {
                         dlRunning -> "下载中 " + dlPct + "%　·　点此取消"
-                        UpdateService.pendingApk(ctx) != null -> "⬇ 立即安装已下载的包"
+                        pending != null -> "⬇ 立即安装已下载的包（" + rem.versionName + "）"
                         else -> "⬇ 下载并在应用内安装"
                     }
                     Text(
@@ -375,8 +376,8 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
                                     note = "已请求取消下载"
                                     return@clickable
                                 }
-                                // 已经下好一份 → 直接拉安装器，不重下 24 MB
-                                val pending = UpdateService.pendingApk(ctx)
+                                // 已经下好**本版本**那一份 → 直接拉安装器，不重下 24 MB。
+                                // 旧版本的包一律不认（见上面 pending 的注释）。
                                 if (pending != null) {
                                     ApkInstaller.install(ctx, pending)
                                     return@clickable
@@ -394,6 +395,8 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
                                         UpdateService.start(
                                             ctx, u, rem.ghApkName.ifBlank { rem.apk },
                                             if (rem.ghSizeKnown) rem.size else 0L, rem.md5,
+                                            sha256 = rem.ghSha256,
+                                            version = rem.versionName,
                                         )
                                         dlTick++
                                     }
@@ -452,7 +455,7 @@ fun HplayUpdatePanel(onClose: () -> Unit) {
                             if (rem.ghTag.isNotBlank()) {
                                 append("\n安装前系统会问一次「是否允许 Hplay 安装应用」，允许一次即可。")
                             } else {
-                                append("\n139/网盘的直链是签名临时地址（约 15 分钟有效），退回浏览器那条路时点一次取一次。")
+                                append("\n网盘的直链是签名临时地址（约 15 分钟有效），退回浏览器那条路时点一次取一次。")
                             }
                         },
                         color = TextFaint, fontSize = 10.5.sp, lineHeight = 15.sp,
@@ -534,42 +537,59 @@ fun HplayUpdatePopup(
                 .clickable { }
                 .padding(18.dp),
         ) {
-            Text("🔔", fontSize = 22.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
-            Spacer(Modifier.height(6.dp))
+            // ★★ 第 332 轮：**去掉顶部 emoji**。
+            //
+            // 原来这里有个 🔔。在采信它的 ROM 上是个铃铛，在字体缺这个码位的机器上
+            // 就是一个方框 —— 弹窗第一眼看到方框，比没有图标更糟。标题本身就够醒目，
+            // 不需要靠 emoji 撑场。
             Text(
-                "发现新版本", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold,
+                "发现新版本", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold,
                 modifier = Modifier.align(Alignment.CenterHorizontally),
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                "v" + remote.versionName + "　·　" + remote.sizeText,
+                "v" + remote.versionName + "　·　" + remote.sizeText +
+                    "　·　" + HplayUpdateChannel.lineLabel(HplayUpdateChannel.line),
                 color = TextFaint, fontSize = 11.5.sp,
                 modifier = Modifier.align(Alignment.CenterHorizontally),
             )
             Spacer(Modifier.height(12.dp))
             Text("这一版改了什么", color = HplayOnSurface, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(6.dp))
-            // ★★ LABUPD1：说明区**限高 + 可滚动**（最多 8 条），
-            //   保证「下次再说 / 立即更新」两个按钮永远在屏幕内可见。
-            val allNotes = remote.notes.split("\n").map { it.trim() }.filter { it.isNotEmpty() }
-            val noteLines = allNotes.take(8)
+            // ★★ 第 332 轮（用户要求「每次更新都简略写明核心更新」）：
+            //
+            // 旧版直接把 GitHub Release 的 body 原样列出来。实测那个 body 往往是
+            // 一堆 commit subject："Merge pull request #705 from ..."、
+            // "↓ (@misaka10032w) #703 ..."、dependabot 的版本号……
+            // 十几条里真正有用的一两条被淹掉，用户看完还是不知道更新了什么。
+            //
+            // 现在先**提炼**（[coreNotes]）：去掉 merge/依赖升级/纯哈希这类噪音，
+            // 剥掉提交者前缀与 markdown 记号，最多留 5 条，每条截到 2 行长度。
+            // 用户要完整清单时，面板里看得到（这里只讲核心）。
+            val allNotes = coreNotes(remote.notes)
+            val noteLines = allNotes.take(5)
             Column(
-                Modifier.fillMaxWidth().heightIn(max = 210.dp)
+                Modifier.fillMaxWidth().heightIn(max = 200.dp)
                     .clip(RoundedCornerShape(10.dp)).background(CardColorSoft)
                     .verticalScroll(rememberScrollState()).padding(12.dp),
             ) {
                 if (noteLines.isEmpty()) {
-                    Text("（这一版没有附更新说明）", color = TextFaint, fontSize = 12.sp, lineHeight = 18.sp)
+                    Text(
+                        "（这一版没有附更新说明）",
+                        color = TextFaint, fontSize = 12.sp, lineHeight = 18.sp,
+                    )
                 } else {
                     noteLines.forEach { ln ->
                         Text(
                             "· " + ln,
                             color = HplayOnSurface, fontSize = 12.sp, lineHeight = 18.sp,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    if (allNotes.size > 8) {
+                    if (allNotes.size > 5) {
                         Text(
-                            "……共 " + allNotes.size + " 条，完整说明见「检查更新」面板",
+                            "……另有 " + (allNotes.size - 5) + " 条，完整说明见「检查更新」面板",
                             color = TextFaint, fontSize = 11.sp, lineHeight = 16.sp,
                         )
                     }
@@ -594,4 +614,73 @@ fun HplayUpdatePopup(
             }
         }
     }
+}
+
+/**
+ * **把更新说明提炼成「核心更新」**（第 332 轮，用户要求「每次更新都简略写明核心更新」）。
+ *
+ * ## 为什么需要提炼
+ *
+ * GitHub Release 的 body 实测长这样（Han1meViewer 的真实发布）：
+ * ```
+ * ↓ (@misaka10032w)
+ * Merge pull request #705 from misaka10032w/fix/minor-fixes
+ *
+ * [Improve] 增加APP级缩放限制上限，防止雷霆系统缩放导致APP布局错位，可在设置-外观与交互-界面与布局更改
+ *
+ * ↓ (@misaka10032w)
+ * #703 增加APP级缩放限制上限，防止雷霆系统缩放导致APP布局错位
+ * ```
+ * 六条里只有一条是用户看得懂、用得上的（缩放限制）。其余是 merge 记录、
+ * 提交者署名、版本号、dependabot 的依赖升级。
+ *
+ * ## 提炼规则（按顺序）
+ *
+ * 1. 按 `↓ (@xxx)` 这类署名行切成块，署名行本身丢掉；
+ * 2. 丢掉：merge / bump / dependabot / 纯 `#123 标题` 的重复引用 / 
+ *    纯哈希 / `Signed-off-by` / `Co-authored-by`；
+ * 3. 剥掉 markdown 记号（`###`、`**`、`- [x]`、反引号）；
+ * 4. 去重（同一句常因为 merge 出现两次）；
+ * 5. 每条压成一行（换行变空格），超长由界面按 3 行截断。
+ *
+ * 提炼后如果**一条都不剩**（说明这条发布确实是纯 CI 噪音），
+ * 返回空列表 —— 界面会显示「这一版没有附更新说明」，这比显示六条 merge 记录诚实。
+ */
+internal fun coreNotes(raw: String): List<String> {
+    if (raw.isBlank()) return emptyList()
+    val out = ArrayList<String>()
+    val seen = HashSet<String>()
+    for (rawLine in raw.split("\n")) {
+        var ln = rawLine.trim()
+        if (ln.isEmpty()) continue
+        // 1) 提交者署名行（`↓ (@name)` / `(@name)`）
+        if (ln.startsWith("↓") || Regex("^\\\\(@[^)]+\\\\)$").matches(ln)) continue
+        // 2) 噪音判据（大小写不敏感）
+        val low = ln.lowercase()
+        if (low.startsWith("merge pull request") || low.startsWith("merge branch") ||
+            low.startsWith("merge remote-tracking") || low.contains("dependabot") ||
+            low.startsWith("bump ") || low.startsWith("signed-off-by") ||
+            low.startsWith("co-authored-by") || low.startsWith("this reverts commit")
+        ) continue
+        // 3) 剥 markdown
+        ln = ln.replace(Regex("^#{1,6}\\s*"), "")
+            .replace("**", "")
+            .replace("__", "")
+            .replace(Regex("^[-*+]\\s+"), "")
+            .replace(Regex("^\\[x\\]\\s*"), "")
+            .replace("`", "")
+            .trim()
+        if (ln.isEmpty()) continue
+        // 4) 纯哈希 / 纯版本号 / 过短
+        if (Regex("^[0-9a-f]{7,40}$").matches(ln)) continue
+        if (Regex("^v?\\d+(\\.\\d+)+(\\S*)?$").matches(ln)) continue
+        if (ln.length < 6) continue
+        // 5) 压成一行
+        ln = ln.replace(Regex("\\s+"), " ").trim()
+        // 6) 去重（按归一化后的文本）
+        val key = ln.lowercase().replace(Regex("[^a-z0-9\\u4e00-\\u9fa5]"), "")
+        if (key.isEmpty() || !seen.add(key)) continue
+        out.add(ln)
+    }
+    return out
 }

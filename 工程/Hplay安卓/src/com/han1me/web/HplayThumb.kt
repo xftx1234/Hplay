@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.javrocket.hanime.HanimeClient
 import java.util.Collections
+import java.util.LinkedHashMap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import com.han1me.HplayOnSurface
@@ -40,31 +41,194 @@ import com.han1me.HplayOutline
 /** 缓存项：解码后的图 + 它实际占的字节（ARGB_8888 按 宽×高×4 估）。 */
 private data class ThumbEntry(val img: ImageBitmap, val bytes: Long)
 
-// ★ 第 84 轮（用户报「头像加载太慢、有的加载不出来」）：
-// 原上限 72 张 / 24MB —— 而订阅页光作者就有 60 个，加上封面对 72 张的 LRU 是**边滑边淘汰**，
-// 淘汰掉的再滚回来又要重下（用户感受就是「慢且有的出不来」）。
-// 提到 220 张 / 48MB：按头像（200px ⇒ 约 160KB/张）算，60 个头像约 9.6MB，余量充足。
+// ★ 第 84 轮（用户报「头像加载太慢、有的加载不出来」）：上限从 72 张 / 24MB 提到现在的量。
 private const val MAX_ENTRIES = 220
 private const val MAX_BYTES = 48L * 1024 * 1024
+/** 无论多大都至少留这么多张 —— 否则首屏自己就把自己踢空。 */
+private const val MIN_KEEP = 12
+
+// ★★★ 第 337 轮（复核第 336 轮）：**336 轮那次缓存修复本身是错的，本轮重做。**
+//
+// 336 轮把 removeEldestEntry 里的 `values.sumOf { it.bytes }`（O(n)）换成了自维护的
+// totalBytes 累加器，以为这样就修好了。实测不成立，原因在 LinkedHashMap 的语义：
+//
+//   removeEldestEntry 返回 true 时，Map **自己**把 eldest 摘掉，
+//   走的是**不经过** `remove(key)` 覆写的内部路径。
+//   （想靠覆写 afterNodeRemoval 兜住也不行：它是包级私有，Kotlin 在别的包里连编译都过不去。）
+//
+// 于是每淘汰一张，totalBytes 只加不减。同参数实测（JDK 21）：
+//   首屏 20 张 1280×720（每张 3.7MB）→ totalBytes = 73,728,000，
+//   而 48MB 上限 = 50,331,648。第一次超限之后计数永久大于上限，
+//   之后**每次 put 都立刻触发淘汰**，缓存被自己的错误计数锁死成「只留 1~2 张」。
+//   人话：加了缓存反倒每张都重下，正好就是用户报的「加了缓存后变慢」。
+//
+// 正确做法（本轮）：**不再依赖 removeEldestEntry 的副作用**，改成显式淘汰循环 ——
+//   自己取迭代器、自己减 totalBytes、自己 it.remove()。计数与容器永远同步，
+//   也顺带绕开「removeEldestEntry 一次只能淘汰 1 条」（一次插入可能超限很多）。
+//
+// 另一条同源结论：只按字节收也不够。一张 1000px 封面解码后 2.25MB，
+// 48MB 只装得下 21 张 —— 首屏就填满，等于没有缓存。所以卡片封面改用
+// [CARD_DECODE_W] 解码（见 SiteCard 的调用点），单张降到约 0.52MB，同样 48MB 能装 90 多张。
+private val thumbLock = Any()
+
+/** accessOrder = true ⇒ 迭代器从「最久未用」开始，淘汰顺序天然就是 LRU。 */
+private val thumbCache = LinkedHashMap<String, ThumbEntry>(64, 0.75f, true)
+
+/** 缓存内所有条目解码后的总字节。**只允许在 thumbLock 内读写。** */
+private var totalBytes: Long = 0L
+
+/** 显式淘汰：逐条摘掉最久未用的，直到回到水位以下。必须在 thumbLock 内调用。 */
+private fun evictLocked() {
+    // ★★★ 第 344 轮（全量核查 · P1 · 可致 OOM）：**字节上限必须能压过张数下限**。
+    //
+    // 原来第一行就是 `if (thumbCache.size <= MIN_KEEP) return`（MIN_KEEP = 12），
+    // 而 MAX_BYTES = 48MB 是字节上限。两者冲突时**张数赢**：
+    //   · cos 板块用 decodeMaxW = 1600 解码（CosBoard.kt），一张 1600x2400 的图
+    //     = 1600*2400*4 ≈ 15.4 MB；
+    //   · 滑 12 张 = 154MB 位图常驻，totalBytes 早已 3 倍超限，
+    //     但每次淘汰都在第一行返回 —— 低内存机型直接 OutOfMemoryError；
+    //   · 更糟的是早退时连 thumbStateDrop 都不跑，位图被 state 表钉住无法回收。
+    //
+    // 现在：只保「不能把缓存清空」这一条（留 1 张），字节上限永远生效。
+    // 代价是极端情况下缓存只剩 1 张 —— 那也比 OOM 崩掉强。
+    if (thumbCache.size <= 1) return
+    val it = thumbCache.entries.iterator()
+    while (it.hasNext()) {
+        if (thumbCache.size <= 1) break
+        if (thumbCache.size <= MAX_ENTRIES && totalBytes <= MAX_BYTES) break
+        val e = it.next()
+        totalBytes -= e.value.bytes
+        // ★ 第 340 轮自查修：**淘汰必须连 state 缓存一起清**。
+        // state 缓存只存引用，但它会阻止位图被 GC —— 如果只管加不管删，
+        // 一个 400 条的 state 表能把已经被 thumbCache 淘汰的位图全部钉在内存里
+        // （400 × 0.5MB ≈ 200MB），比不做缓存糟得多。
+        thumbStateDrop(e.key)
+        it.remove()
+    }
+}
+
+private fun cacheGet(key: String): ImageBitmap? = synchronized(thumbLock) { thumbCache[key]?.img }
+
+private fun cachePut(key: String, img: ImageBitmap) = synchronized(thumbLock) {
+    val bytes = img.width.toLong() * img.height * 4L
+    val old = thumbCache.put(key, ThumbEntry(img, bytes))
+    if (old != null) totalBytes -= old.bytes
+    totalBytes += bytes
+    evictLocked()
+}
 
 /**
- * 按**解码后字节数**收，不按张数。
+ * **磁盘持久化封面缓存**（第 336 轮，用户要求"既不掉速又不用重载"）。
  *
- * 旧版是 `size > 48`：一张 1280×720 的 ARGB_8888 就是 3.7 MB，48 张理论上限 176 MB，
- * 那是「多翻几屏就闪退」的形态而不是缓存。现在 24 MB / 72 张双上限，最少也留 6 张（不然首屏就会被自己踢掉）。
+ * 内存缓存解决不了冷启动：进程一死就全丢，下次进来还得把整屏封面重下一遍。
+ * 这里把**原始字节**按 URL 的 hash 落盘，下次启动先读盘（几 ms）再解码，
+ * 网络只在盘里没有时才发。
+ *
+ * 为什么不存解码后的 Bitmap：Bitmap 落盘要重新编码 PNG，比存原始 JPEG 大 5~10 倍
+ * 且编码本身耗时，反而更慢。存原字节 + 解码是最省的做法。
+ *
+ * 容量：500 个文件 / 40 MB，超了按最后修改时间删最旧的。放在 cacheDir，
+ * 系统空间紧张时会自动清理，不会占用户存储配额。
  */
-private val thumbCache = Collections.synchronizedMap(
-    object : LinkedHashMap<String, ThumbEntry>(64, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ThumbEntry>?): Boolean =
-            size > 6 && (size > MAX_ENTRIES || values.sumOf { it.bytes } > MAX_BYTES)
-    },
-)
+private object ThumbDisk {
+    private const val MAX_FILES = 500
+    private const val MAX_BYTES = 40L * 1024 * 1024
 
-/** 解码宽度上限：站源常见 1280×720，而手机上没有一张封面真需要 1280 px（卡片只有 206 dp 宽）。 */
+    /** ★ 第 340 轮：trim 节流 —— 每写这么多张才真清一次（见 put 的注释）。 */
+    private const val TRIM_EVERY = 64
+    private val putCounter = java.util.concurrent.atomic.AtomicInteger(0)
 
-/** 缓存键：把解码尺寸也带进去（头像 200px 与封面 1000px 不能互相顶掉）。第 84 轮。 */
-private fun ck(url: String, maxW: Int): String = if (maxW == DECODE_MAX_W) url else "$url@$maxW"
+    @Volatile
+    private var dir: java.io.File? = null
+
+    private fun dir(): java.io.File? {
+        dir?.let { if (it.isDirectory) return it }
+        val ctx = com.han1me.HplayEnv.applicationOrNull() ?: return null
+        val d = java.io.File(ctx.cacheDir, "thumb-v2")
+        if (!d.isDirectory && !d.mkdirs()) return null
+        dir = d
+        return d
+    }
+
+    private fun fileFor(key: String): java.io.File? {
+        val d = dir() ?: return null
+        val h = Integer.toHexString(key.hashCode())
+        return java.io.File(d, h + ".img")
+    }
+
+    /** 上次刷新 mtime 的节流窗口：1 小时内不重复写盘（写盘比读盘更贵，见下）。 */
+    private const val TOUCH_WINDOW_MS = 3_600_000L
+
+    fun get(key: String): ByteArray? = runCatching {
+        val f = fileFor(key) ?: return null
+        if (!f.isFile || f.length() <= 0L) return null
+        // 读盘时顺手刷新 mtime，LRU 淘汰就按它排序（读盘命中的应该留得更久）。
+        //
+        // ★ 第 340 轮：**加节流**。原实现每读一次就 setLastModified 一次 ——
+        // 那是一次真实的磁盘写（inode 更新），一屏 12 张 = 12 次额外写。
+        // 现在同一文件一小时内只写一次，语义不变而开销归零（缓存命中本该是纯读）。
+        val now = System.currentTimeMillis()
+        if (now - f.lastModified() > TOUCH_WINDOW_MS) {
+            runCatching { f.setLastModified(now) }
+        }
+        f.readBytes()
+    }.getOrNull()
+
+    fun put(key: String, bytes: ByteArray) {
+        runCatching {
+            if (bytes.size < 512) return   // 太小的是错误页，不值得落盘
+            val f = fileFor(key) ?: return
+            f.writeBytes(bytes)
+            // ★★★ 第 340 轮（用户报「糖心板块封面加缓存后慢了不少」）：**trim 绝不能每次 put 都跑**。
+            //
+            // 原实现每写一张图就 trim() 一次，而 trim() 是
+            //   d.listFiles() + files.sumOf { it.length() }
+            // —— 500 个文件就是 500 次 stat，全在 IO 线程上，且**与写图串行**。
+            // 一屏 12 张图 = 6000 次 stat，比下载本身还慢，这就是「加了缓存反而更慢」。
+            //
+            // 现在按次数节流：累计写满 TRIM_EVERY 张才清一次，平时一次 list/stat 都不做。
+            // 上限由 trim 自己保证（超额才真删），差几十张不会失控。
+            if (putCounter.incrementAndGet() >= TRIM_EVERY) {
+                putCounter.set(0)
+                trim()
+            }
+        }
+    }
+
+    /** 删掉某一条（盘里那份解不开时用）。 */
+    fun remove(key: String) {
+        runCatching { fileFor(key)?.delete() }
+    }
+
+    /** 超限时按 mtime 从旧到新删，直到回到水位以下。 */
+    private fun trim() {
+        val d = dir() ?: return
+        val files = d.listFiles() ?: return
+        if (files.size <= MAX_FILES && files.sumOf { it.length() } <= MAX_BYTES) return
+        files.sortedBy { it.lastModified() }
+            .take((files.size - MAX_FILES).coerceAtLeast(0) + 40)
+            .forEach { runCatching { it.delete() } }
+    }
+
+    /** 清空磁盘缓存（设置里的"清空封面缓存"用）。 */
+    fun clear() {
+        runCatching { dir()?.listFiles()?.forEach { it.delete() } }
+    }
+}
+
+/**
+ * 解码宽度上限。
+ *
+ * [DECODE_MAX_W] 是介绍页大图（Hero 400dp 高、全宽）用的；
+ * [CARD_DECODE_W] 是列表卡片用的 —— 卡片实际只有 ~180dp 宽（1080p 屏 ≈ 490px），
+ * 按 1000px 解出来再缩下去是白烧 4 倍内存，也是 336 轮「缓存装不下首屏」的直接原因。
+ * 480px 在 3x 屏上仍然不糊，单张 0.52MB，48MB 能装 90 多张。
+ */
 private const val DECODE_MAX_W = 1000
+const val CARD_DECODE_W = 480
+
+/** 缓存键：把解码尺寸也带进去（头像 480px 与封面 1000px 不能互相顶掉）。第 84 轮。 */
+private fun ck(url: String, maxW: Int): String = if (maxW == DECODE_MAX_W) url else "$url@$maxW"
 
 /** 两段式解码：先 `inJustDecodeBounds` 量原图，再按 2 的幂挑 `inSampleSize`，然后真解一次。 */
 private fun decodeSampled(bytes: ByteArray, maxW: Int = DECODE_MAX_W): ImageBitmap? {
@@ -94,13 +258,29 @@ private suspend fun loadThumb(url: String, maxW: Int = DECODE_MAX_W): Any {
         if (f == null || !f.isFile) return BLANK   // 离线副本没留封面：按"没有封面"画占位，不当故障
         val bytes = runCatching { f.readBytes() }.getOrNull() ?: return BLANK
         val img = decodeSampled(bytes, maxW) ?: return "图载失败: 解码失败(${bytes.size}B)"
-        thumbCache[ck(url, maxW)] = ThumbEntry(img, img.width.toLong() * img.height * 4L)
+        cachePut(ck(url, maxW), img)
         return img
+    }
+    // ★ 第 336 轮：**先读磁盘缓存**。冷启动后内存是空的，
+    // 但盘里通常已经有这张图 —— 命中就省掉整个网络往返。
+    // ★ 第 337 轮：命中后统一走 cachePut（336 轮这里是直接 putTracked 往表里塞，
+    // 既绕过计数也绕过淘汰 —— 那个 API 现在已删，改回唯一入口）。
+    val diskKey = ck(url, maxW)
+    val diskBytes = withContext(Dispatchers.IO) { ThumbDisk.get(diskKey) }
+    if (diskBytes != null) {
+        val img2 = decodeSampled(diskBytes, maxW)
+        if (img2 != null) {
+            cachePut(diskKey, img2)
+            return img2
+        }
+        // 盘里那份解不开（源站换图/文件截断）→ 删掉，继续走网络
+        withContext(Dispatchers.IO) { ThumbDisk.remove(diskKey) }
     }
     val (bytes, why) = HanimeClient.fetchThumbBytes(url)
     if (bytes != null) {
         val img = decodeSampled(bytes, maxW) ?: return "图载失败: 解码失败(${bytes.size}B)"
-        thumbCache[ck(url, maxW)] = ThumbEntry(img, img.width.toLong() * img.height * 4L)
+        cachePut(ck(url, maxW), img)
+        withContext(Dispatchers.IO) { ThumbDisk.put(ck(url, maxW), bytes) }
         return img
     }
     // ★★ 第 90 轮（用户报「有些订阅作者图载失败」）：
@@ -123,7 +303,7 @@ private suspend fun loadThumb(url: String, maxW: Int = DECODE_MAX_W): Any {
             if (proxied != null) {
                 val img = decodeSampled(proxied, maxW)
                 if (img != null) {
-                    thumbCache[ck(url, maxW)] = ThumbEntry(img, img.width.toLong() * img.height * 4L)
+                    cachePut(ck(url, maxW), img)
                     return img
                 }
             }
@@ -154,12 +334,28 @@ fun HplayThumb(
      */
     fallbackUrl: String = "",
 ) {
-    var state by remember(url) { mutableStateOf<Any?>(null) }
+    // ★★★ 第 340 轮（用户报「收藏页切换页面就重载，浪费」）：
+    //
+    // 老写法 remember(url) { mutableStateOf(null) } —— 组件一旦离开组合（切底栏、翻页、
+    // 换 tab），state 就没了；回来时先画一帧空白，等 LaunchedEffect 跑完才出图，
+    // 用户看到的就是「每切一次都白闪一下、像重新加载」。
+    //
+    // 现在把**已解析的结果**放进程级表里，重组时直接拿它当初始值：
+    // 内存缓存命中是同步的，第一帧就有图，彻底没有白帧。
+    // 表本身有上限（避免常驻过多），且只存已经在内存缓存里的图，不额外占内存。
+    val key0 = ck(url, decodeMaxW)
+    val init0 = thumbStateGet(key0)
+    var state by remember(url) { mutableStateOf<Any?>(init0) }
     // 第 64 轮：**失败后自动重试**（修「图载失败」红字一直挂着）。
     // 老写法是 LaunchedEffect(url) —— url 不变就只跑一次；
     // 而生产层的图床退避最多 8 秒（第 64 轮由 20 秒缩短），冷却过去后**界面不会自己恢复**，
     // 用户看到的就是「一直坏」。现在失败后等一会儿自动再试，最多 3 次（避免一直打网）。
     var attempt by remember(url) { mutableStateOf(0) }
+    // 解析结果回写进程级表（下一帧/下次进页面直接用）
+    androidx.compose.runtime.LaunchedEffect(state, url) {
+        val v = state
+        if (v is ImageBitmap) thumbStatePut(key0, v)
+    }
     LaunchedEffect(url, attempt) {
         if (url.isBlank()) {
             // 站点自己就没给封面（情色小说、部分文字列表站）——这是**内容形态**，不是故障，
@@ -167,8 +363,9 @@ fun HplayThumb(
             state = BLANK
             return@LaunchedEffect
         }
-        thumbCache[ck(url, decodeMaxW)]?.let {
-            state = it.img
+        // ★ 第 337 轮：这里原来是无锁直读 thumbCache（主线程），改成唯一入口 cacheGet。
+        cacheGet(ck(url, decodeMaxW))?.let {
+            state = it
             return@LaunchedEffect
         }
         val r = withContext(Dispatchers.IO) { loadThumb(url, decodeMaxW) }
@@ -227,3 +424,45 @@ fun HplayThumb(
 
 /** 空封面占位的标记对象（与「加载失败」的字符串区分开：前者是内容形态，后者才是要回显的故障）。 */
 private val BLANK = Any()
+
+/**
+ * ★★★ 第 340 轮（用户报「收藏页切换页面就重载，浪费」）：**已解析结果的进程级备忘**。
+ *
+ * 为什么要它：HplayThumb 内部用 `remember(url) { mutableStateOf(null) }` 持状态，
+ * 组件一旦离开组合（切底栏、切 tab、翻页），那份 state 就被丢弃 —— 回来时先画**一帧空白**，
+ * 等 LaunchedEffect 重新走一遍「查缓存 → 出图」才恢复。看上去就是「每切一次都重新加载」。
+ *
+ * 内存缓存 thumbCache 本身是跨组合的，问题只在于**首帧拿不到值**。
+ * 这里存一份「已解析的 ImageBitmap」，让重组时能**同步**取到初值：
+ *   · 只存 ImageBitmap（位图本身已由 thumbCache 持有，这里只多存一个引用，不额外占像素内存）；
+ *   · 上限 STATE_MAX 条，超出按访问顺序删最旧的。
+ */
+private const val STATE_MAX = 160
+private val thumbStateCache = object : LinkedHashMap<String, ImageBitmap>(64, 0.75f, true) {
+    override fun removeEldestEntry(eldest: Map.Entry<String, ImageBitmap>?): Boolean =
+        size > STATE_MAX
+}
+
+private fun thumbStatePut(key: String, img: ImageBitmap) {
+    synchronized(thumbStateCache) { thumbStateCache[key] = img }
+}
+
+/**
+ * 同步取已解析结果。
+ *
+ * **必须加同一把锁**：LinkedHashMap（accessOrder=true）在并发读写下会破坏内部链表，
+ * 极端情况直接死循环。这里的竞争极低（写只在出图后一次），加锁成本可以忽略。
+ */
+private fun thumbStateGet(key: String): ImageBitmap? =
+    synchronized(thumbStateCache) { thumbStateCache[key] }
+
+/**
+ * 从 state 缓存里删一条（thumbCache 淘汰时同步调用）。
+ *
+ * ★ 第 340 轮自查：state 缓存只存**引用**，但它足以让位图**无法被 GC**。
+ * 如果再叠一层 trim 节流，很容易出现「thumbCache 已经淘汰、state 表还钉着 400 张」的内存黑洞。
+ * 所以淘汰路径必须成对调用它，上限也压到与 thumbCache 同量级（[STATE_MAX]）。
+ */
+private fun thumbStateDrop(key: String) {
+    synchronized(thumbStateCache) { thumbStateCache.remove(key) }
+}

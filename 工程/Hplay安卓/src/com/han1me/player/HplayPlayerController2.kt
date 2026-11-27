@@ -64,19 +64,31 @@ class HplayPlayerController2(
     }
 
     /**
-     * 取 App 的共享 OkHttp（带代理/DoH/边缘节点）。
+     * 取 App 的共享 OkHttp（带代理 / DoH / 边缘节点）。
      *
-     * 用反射取是因为 HanimeClient 在 com.han1me 包、字段名可能随上游变化；
-     * 取不到时回落一个空 client —— 那样播放会失败，但不会崩（错误会在 UI 上显示）。
+     * ★★★ 第 344 轮（播放链路审计 · P0）：**这里原来整段是空的**。
+     *
+     * 原写法 Class.forName("com.han1me.HanimeClient") —— 这个类**根本不存在**。
+     * 上游把 HanimeClient 放在 `com.javrocket.hanime` 包（见 build/gen/HanimeClient.kt 第 1 行），
+     * 所以那次 Class.forName 每次必然抛 ClassNotFoundException，被 getOrElse
+     * 静默吞掉、回落成 `okhttp3.OkHttpClient()` —— 一个**裸客户端**：
+     *   · 不走 DoH，域名解析回到系统 DNS；
+     *   · 不走代理/节点，官方源直连被墙；
+     *   · 不带 App 的 cookie / UA / Referer 默认值。
+     * 真机表现就是「网页播放能看，内嵌播放器报 Source error / 看着看着断」。
+     *
+     * 现在**直接引用**（编译期就检查，再也不会静默降级）。
+     * 另外这条链路要的是**媒体**口径，不是网页口径：
+     *   · 读超时放宽到 90 秒 —— 大分片/慢 CDN 在网页的 30 秒上会被硬掐；
+     *   · 连接池放大到 32 —— 分段下载会同时开十几条连接。
      */
-    private fun ctx2Http(): okhttp3.OkHttpClient {
-        return runCatching {
-            val cls = Class.forName("com.han1me.HanimeClient")
-            val inst = cls.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
-            val m = cls.getDeclaredMethod("getHttp").apply { isAccessible = true }
-            m.invoke(inst) as okhttp3.OkHttpClient
-        }.getOrElse { okhttp3.OkHttpClient() }
-    }
+    private fun ctx2Http(): okhttp3.OkHttpClient = runCatching {
+        com.javrocket.hanime.HanimeClient.http.newBuilder()
+            .readTimeout(90, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .connectionPool(okhttp3.ConnectionPool(32, 5, java.util.concurrent.TimeUnit.MINUTES))
+            .build()
+    }.getOrElse { com.javrocket.hanime.HanimeClient.http }
 
     /** 用户设定的倍速（长按加速结束后恢复到这个）。 */
     private var baseSpeed = 1.0f
@@ -123,7 +135,13 @@ class HplayPlayerController2(
 
             override fun onError(error: Throwable?) {
                 uiState = uiState.copy(state = HplayPlayerState.ERROR)
-                errorText = error?.message ?: "播放失败"
+                // ★ 第 344 轮：media3 的 PlaybackException.message 恒为 Source error，
+                // 真正原因在 cause 链里（HttpDataSourceException / SocketException / 403 等）。
+                // 旧播放器专门拼了 cause.message，重写时丢了 —— 诊断能力回退。
+                val chain = generateSequence(error as Throwable?) { it.cause }
+                    .mapNotNull { it.message?.takeIf { m -> m.isNotBlank() } }
+                    .distinct().take(4).joinToString(" · ")
+                errorText = chain.ifBlank { error?.javaClass?.simpleName ?: "播放失败" }
             }
         }
     }
@@ -133,6 +151,23 @@ class HplayPlayerController2(
      *
      * @param qualities 可选清晰度（高到低）；单清晰度传 listOf("默认") 即可
      */
+    /**
+     * 最近一次起播请求（重试用）。
+     *
+     * ★ 第 344 轮：新播放器出错时只画一行 errorText，**没有任何重收入口** ——
+     * 用户只能退出去再点进来。旧播放器（HplayPlayer.kt）是有「重试」的，
+     * 重写时丢了。这里留一份请求，供 UI 的「重试」原样重放。
+     */
+    private var lastRequest: HplayMediaRequest? = null
+
+    /** 用上一次的请求重试（出错后调）。 */
+    fun retry() {
+        val r = lastRequest ?: return
+        errorText = ""
+        uiState = uiState.copy(state = HplayPlayerState.PREPARING)
+        kernel.prepare(r.copy(startPaused = false))
+    }
+
     fun setMedia(
         url: String,
         title: String = "",
@@ -152,17 +187,24 @@ class HplayPlayerController2(
             currentQualityIndex = qualityIndex.coerceIn(0, (qualities.size - 1).coerceAtLeast(0)),
             hasMedia = true,
         )
-        kernel.prepare(
-            HplayMediaRequest(
-                url = url,
-                title = title,
-                headers = headers,
-                looping = uiState.isLooping,
-                startPositionMs = startPositionMs,
-                speed = if (startPaused) 0f else currentSpeed(),
-                startPaused = startPaused,
-            ),
+        val req = HplayMediaRequest(
+            url = url,
+            title = title,
+            headers = headers,
+            looping = uiState.isLooping,
+            startPositionMs = startPositionMs,
+            // ★★★ 第 344 轮（播放链路审计 · P0）：**speed 不能传 0**。
+            //
+            // 原来写 if (startPaused) 0f else currentSpeed()。0f 一路传到
+            // ExoPlayer.setPlaybackSpeed -> PlaybackParameters.withSpeed -> checkArgument(speed > 0)，
+            // 抛 IllegalArgumentException 崩主线程。预加载语义由下面的 pause() 完成，
+            // 不需要把速度设成 0（Exo 根本不支持 0 倍速）。
+            speed = currentSpeed(),
+            startPaused = startPaused,
         )
+        // 记下来供「重试」原样重放（见 lastRequest 的注释）。
+        lastRequest = req
+        kernel.prepare(req)
         if (startPaused) {
             // 预加载：先 prepare 但不开播，等用户点
             kernel.pause()
@@ -246,6 +288,56 @@ class HplayPlayerController2(
         return (kernel as? HplayExoKernel)?.exoPlayer()
     }
 
+    /** 上一次挂上去的 TextureView（同一实例不重复挂，避免每帧一次 binder 调用）。 */
+    private var lastTexture: android.view.TextureView? = null
+
+    /**
+     * 把渲染目标挂到内核。
+     *
+     * ★★★ 第 344 轮（全量核查 · P1）：**渲染层从 PlayerView 改成裸 TextureView**。
+     *
+     * 原来的写法（HplayPlayerView2 的 factory 里）：
+     * ```kotlin
+     * runCatching {
+     *     val fld = PlayerView::class.java.getDeclaredField("surfaceType")
+     *     fld.isAccessible = true
+     *     fld.setInt(this, 2)   // 2 = SURFACE_TYPE_TEXTURE_VIEW
+     * }
+     * ```
+     * 这段**从来没有生效过**。用 javap 查 media3-ui 1.4.1 的 PlayerView：
+     *   · 字段只有 `private final View surfaceView`，**没有 surfaceType 字段**；
+     *   · 它只在**构造函数**里读 XML 属性 `R.styleable.PlayerView_surface_type`
+     *     （`PlayerView(Context, AttributeSet, int)`），构造完就定死了。
+     * 所以 `getDeclaredField("surfaceType")` 必然抛 NoSuchFieldException，
+     * 被 runCatching 静默吞掉 —— 实际仍然是默认的 SurfaceView。
+     * 也就是说"必须用 TextureView 否则黑屏"这个结论**从来没落地**。
+     *
+     * 现在不用 PlayerView 了：直接创一个 TextureView，调 ExoPlayer 官方的
+     * `videoComponent.setVideoTextureView(...)`。这条路不依赖任何私有字段，
+     * 也正是 Han1meViewer 的 PlayerSurface.kt 的做法（它干脆自己写 TextureView）。
+     *
+     * 为什么必须 TextureView 而不是 SurfaceView：
+     *   · SurfaceView 的 Surface 由 WindowManager 单独合成，**不在 View 层级里**，
+     *     布局变化 / 视图复用 / Compose 的 AndroidView 重建都会让 Surface 销毁重建，
+     *     而 ExoPlayer 的 output surface 不会自动跟进 → 有声音、进度在走、画面全黑；
+     *   · 动画 / transform / alpha 对它无效（我们看到的就是一块黑）；
+     *   · TextureView 是普通 View，走正常绘制管线，布局变化不丢 Surface。
+     * 代价是多一次 GPU 拷贝，1080p 完全够。
+     */
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    fun attachTextureView(tv: android.view.TextureView?) {
+        val exo = rawExoPlayer() ?: return
+        if (tv == null) {
+            lastTexture = null
+            runCatching { exo.videoComponent?.clearVideoSurface() }
+            return
+        }
+        if (lastTexture === tv) return
+        lastTexture = tv
+        runCatching { exo.videoComponent?.setVideoTextureView(tv) }
+            .onFailure { android.util.Log.w("hplay.player", "setVideoTextureView 失败：" + it.message) }
+    }
+
     /** 释放（页面离开时调）。 */
     fun release() {
         runCatching { kernel.release() }
@@ -261,7 +353,12 @@ class HplayPlayerController2(
         progress = HplayPlayerProgress(
             positionMs = pos,
             durationMs = dur,
-            bufferedPercent = if (dur > 0) ((pos * 100) / dur).toInt().coerceIn(0, 100) else 0,
+            // ★ 第 344 轮（全量核查 · P1）：**这里原来填的是「播放位置百分比」，不是缓冲**。
+            //   bufferedPercent = (pos * 100) / dur
+            // 底栏那个 "xx%" 徽标写的位置就在"缓冲"旁边，用户读到的是进度数字，
+            // 而它跟左边刚显示的时间完全是同一个比例 —— 真正的缓冲（能跳到多远）根本看不到。
+            // 现在读内核的 bufferedPercentage（ExoPlayer 给的是已缓冲占比）。
+            bufferedPercent = kernel.bufferedPercent,
         )
         diag = buildString {
             append(if (playing) "播放中" else "已暂停")
@@ -290,7 +387,26 @@ fun rememberHplayController2(ownerKey: String? = null): HplayPlayerController2 {
     val ctx = LocalContext.current
     val c = remember(ownerKey) { HplayPlayerController2(ctx.applicationContext) }
     DisposableEffect(c) {
-        onDispose { runCatching { c.release() } }
+        onDispose {
+            runCatching { c.release() }
+            // ★★★ 第 338 轮（用户报「全屏播放用返回手势后停在横屏」）：
+            //
+            // 播放器被销毁时必须把方向锁交还。原来只有「点退出全屏按钮」才解锁，
+            // 而安卓返回手势走的是**销毁路径** —— 系统手势导航在播放全屏时优先拦下返回，
+            // Activity 直接走 finish/onBackPressed，Compose 树被拆掉，
+            // 于是 requestedOrientation 永远停在 SENSOR_LANDSCAPE。
+            //
+            // owner = null 是强制解锁：销毁路径不该再问"是谁锁的"，
+            // 组件都没了，锁一定是失效的。
+            runCatching {
+                if (com.han1me.HplayEnv.isFullscreen) {
+                    com.han1me.HplayEnv.applyFullscreen(false)
+                }
+                com.han1me.player.HplayOrientation.release(
+                    ctx.applicationContext, "player-dispose",
+                )
+            }
+        }
     }
     // 进度泵：只在有媒体时跑
     LaunchedEffect(c, c.uiState.hasMedia) {

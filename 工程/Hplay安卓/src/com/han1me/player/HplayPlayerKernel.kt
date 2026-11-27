@@ -118,6 +118,14 @@ interface HplayPlayerKernel {
     /** 总时长（ms）。 */
     val durationMs: Long
 
+    /**
+     * 已缓冲占比（0..100）。
+     *
+     * ★ 第 344 轮：控制器原来拿「播放位置 / 时长」冒充缓冲百分比，
+     * 底栏那个百分号跟左边的时间是同一个比例，等于没显示缓冲。现在由内核如实报。
+     */
+    val bufferedPercent: Int
+
     /** 准备媒体。 */
     fun prepare(request: HplayMediaRequest)
 

@@ -31,6 +31,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -152,7 +153,12 @@ fun HplayDownloadsPanel(
     }
     var showDir by remember { mutableStateOf(false) }
     var showConc by remember { mutableStateOf(false) }
-    var collapsed by remember { mutableStateOf(false) }
+    // ★ 第 344 轮（全量核查 · P1）：**折叠状态按分组各自记**。
+    // 原来是一个全局布尔 —— 点任意一个分组的「收起」，所有分组一起折叠，
+    // 按钮文案也全变成「展开」，用户没法只收一组看另一组。
+    val collapsedGroups = remember { mutableStateMapOf<String, Boolean>() }
+    fun isCollapsed(g: String) = collapsedGroups[g] == true
+    fun toggleCollapsed(g: String) { collapsedGroups[g] = !isCollapsed(g) }
     var query by remember { mutableStateOf("") }
     var searching by remember { mutableStateOf(false) }
     var msg by remember { mutableStateOf<String?>(null) }
@@ -426,14 +432,14 @@ fun HplayDownloadsPanel(
                         Text("${gItems.size}部影片", color = TextFaint, fontSize = 11.sp)
                     }
                     Text(
-                        if (collapsed) "展开" else "收起", color = Color.White, fontSize = 12.sp,
+                        if (isCollapsed(gName)) "展开" else "收起", color = Color.White, fontSize = 12.sp,
                         modifier = Modifier.clip(RoundedCornerShape(6.dp)).background(HplayPrimary)
-                            .clickable { collapsed = !collapsed }.padding(horizontal = 14.dp, vertical = 6.dp),
+                            .clickable { toggleCollapsed(gName) }.padding(horizontal = 14.dp, vertical = 6.dp),
                     )
                 }
                 Spacer(Modifier.height(10.dp))
 
-                if (!collapsed) {
+                if (!isCollapsed(gName)) {
                 DownloadedList(
                     items = gShown,
                     selectMode = selectMode,
@@ -450,7 +456,7 @@ fun HplayDownloadsPanel(
                 // 第 65 轮：组内页脚已移除 —— 翻页统一由**底部固定翻页栏**承担
                 // （用户要求「做一个固定下载页的翻页按钮，可翻页查看其余视频」）。
                 Spacer(Modifier.height(14.dp))
-                }        // ← if (!collapsed)
+                }        // ← if (!isCollapsed(gName))
             }            // ← byGroup.forEach（第 60 轮：分组循环）
         } else {
             // 已完成/失败/取消的**记录**（不是文件）在这里清掉；文件仍要回「已下载」页签逐条删。

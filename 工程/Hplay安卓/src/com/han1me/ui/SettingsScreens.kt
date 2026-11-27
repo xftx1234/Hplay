@@ -194,6 +194,47 @@ fun AppearanceSettingsScreen(onBack: () -> Unit) {
             }
         }
         item {
+            // ★ 第 335 轮（用户要求）：背景图自定义就放外观板块。
+            // 设置键 ui.bg.file；选择后 invalidate 让全局背景层下一帧重载。
+            var bgTick by remember { mutableStateOf(0) }
+            val bgFile = remember(bgTick) { com.han1me.X99.setting("ui.bg.file", "") }
+            HplaySectionGroup("背景图") {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("自定义背景", color = cs.onSurface, fontSize = 14.sp)
+                        Text(
+                            if (bgFile.isBlank()) "当前：内置默认图" else "当前：自定义图已启用",
+                            color = cs.onSurfaceVariant,
+                            fontSize = 11.sp,
+                        )
+                    }
+                    androidx.compose.material3.TextButton(onClick = {
+                        if (com.han1me.HplaySlots.pickSupported) {
+                            com.han1me.HplaySlots.pickImage("ui.bg.file") { picked ->
+                                if (picked != null) {
+                                    com.han1me.X99.putSetting("ui.bg.file", picked)
+                                    com.han1me.ui.HplayBg.invalidate()
+                                    bgTick++
+                                }
+                            }
+                        }
+                    }) { Text("选择图片") }
+                    if (bgFile.isNotBlank()) {
+                        androidx.compose.material3.TextButton(onClick = {
+                            com.han1me.X99.putSetting("ui.bg.file", "")
+                            com.han1me.ui.HplayBg.invalidate()
+                            bgTick++
+                        }) { Text("恢复默认") }
+                    }
+                }
+            }
+        }
+        item {
             HplaySectionGroup("显示") {
                 HplaySwitchRow(
                     title = "深色模式",

@@ -119,7 +119,7 @@ class LoginActivity : Activity() {
             domStorageEnabled = true
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             javaScriptCanOpenWindowsAutomatically = true
-            // 与 CfVerifyActivity 使用同一个 UA（clearance 与 UA 强绑定）
+            // 与 HplayGateActivity 使用同一个 UA（clearance 与 UA 强绑定）
             userAgentString = CfUa.USER_AGENT
         }
         wv.webViewClient = object : WebViewClient() {

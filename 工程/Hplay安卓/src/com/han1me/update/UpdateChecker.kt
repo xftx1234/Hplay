@@ -13,34 +13,28 @@ import org.json.JSONObject
 /**
  * 「检查更新」。
  *
- * ## 两条通道，139 直连优先
+ * ## 第 332 轮：139 直连整条移除，改为 **GitHub 默认 + 自建网盘垫底**
  *
- * **主通道：移动云盘 139 直连**（[Yun139]）。
- * App 自己跟 139 对话，取 `移动云盘134 → hplay → version.json`。
- * 移动云盘是公网可达的，所以**移动流量/户外也能用** —— 这正是换通道的原因：
- * 自建网盘是家里的服务（公网域名 + Cloudflare），出门就请求不到。
+ * 用户原话：「彻底去除 139 直连相关更新渠道，代码层也去掉，改成 github 默认 + 自建垫底」。
  *
- * **兜底通道：自建网盘（OpenList）**。
- * 139 那条路要求凭据可用；凭据缺失、过期、或 139 侧异常时，
- * 回落到仍然可用的网盘通道 —— **升级通道不会因为一条路断了就整个不可用**。
+ * 所以这个文件现在只管两条路：
+ *  · **GitHub**（[GitHubReleases]）：默认。匿名可读，不需要任何凭据。
+ *  · **自建网盘 OpenList**（本文件）：垫底。只读 API，也不需要凭据。
  *
- * ## ★ 兼容性（用户明确要求：从旧版本能检测到新通道的更新）
+ * 139 为什么必须删：它要一条 Basic 凭据才能取清单与直链，而凭据等价于
+ * 移动云盘账号的访问权。第 331 轮实测发现它会被原样编进 classes*.dex ——
+ * 公开分发版只能靠 `--no-cred` 剥掉，剥掉后这条渠道**本来就用不了**。
+ * 留一条默认失效的渠道只会让用户看到「未配置凭据」的失败页。
  *
- * 两条通道**读的是同一个目录**：mea 网盘挂载的就是 139 的 `/移动云盘134`（驱动 139Yun），
- * 而 `push_to_mea.py` 推的也是这个目录。所以：
- *  - **计划任务不用改**（还是构建新版本 → 推到那个目录 → 写 version.json）；
- *  - **装旧版本的用户照常能检测到更新**（旧版本走网盘通道，读到的还是同一份 version.json）；
- *  - 新版本多了一条 139 直连，且把网盘留在兜底位上。
- *
- * ## 又一个必须如实标注的限制
- * 两条通道给出的都是**带签名的临时直链**（139 自家 CDN / 网盘 raw_url，约 15 分钟有效）。所以：
+ * ## 网盘通道的限制（如实标注，别在界面上说成「已是最新」）
+ * 网盘给出的 raw_url 是**带签名的临时直链**（约 15 分钟有效）。所以：
  *  - 「检查更新」每次点都**重新取一次**，不复用旧值；
- *  - 界面上的「下载」按钮把它交给系统浏览器/下载器**立刻**用掉；
+ *  - 拿到直链就立刻交给 [UpdateService] 去下；
  *  - 不把直链存进任何持久化位置（存了也会过期，反而制造「点了没反应」）。
  *
  * ## 诚实性
- * 两条通道**都**取不到时才如实说取不到，并列出两边各自的原因；
- * 不显示「已是最新」—— 那会把「没查到」谎报成「查过了」。
+ * 取不到就如实说取不到并给出原因；**绝不显示「已是最新」** ——
+ * 那会把「没查到」谎报成「查过了」。
  */
 object UpdateChecker {
 
@@ -52,13 +46,16 @@ object UpdateChecker {
      * 每次发版都把 APK 与 version.json 推到**下面每一个目录**；读取时按顺序试，
      * **任一条通就拿到清单** ⇒ 单条挂载故障不会让「检查更新」整体失效。
      *
-     * 顺序 = 用户指定的优先级：移动云盘134（默认）→ 移动云盘195 → 天翼云盘134 → 123云盘134。
+     * 顺序 = 第 113 轮定的优先级：移动云盘134 → 移动云盘195 → 天翼云盘134 → 123云盘134。
+     *
+     * 第 332 轮：这些目录是**网盘（OpenList）的挂载点**，读它们只需要网盘的只读 API，
+     * 不需要任何账号凭据 —— 与已删除的 139 直连是两件事，别混。
      */
     private val REMOTE_DIRS = listOf(
-        "/移动云盘134/hplay",       // ① 默认通道
-        "/移动云盘195/hplay",       // ② 备用（139 家族另一个账号）
-        "/天翼云盘134-个人云/hplay",   // ③ 天翼云盘
-        "/123云盘134/hplay",      // ④ 123 云盘
+        "/移动云盘134/hplay",       // ①
+        "/移动云盘195/hplay",       // ②
+        "/天翼云盘134-个人云/hplay",   // ③
+        "/123云盘134/hplay",      // ④
     )
     /** 兼容旧引用：默认第一条。 */
     private val REMOTE_DIR get() = REMOTE_DIRS.first()
@@ -97,7 +94,13 @@ object UpdateChecker {
         val md5: String,
         val notes: String,
         val apk: String,
-        /** 139 直连才有的 fileId（网盘通道为空串）。 */
+        /**
+         * 139 直连才有的 fileId。
+         *
+         * ★ 第 332 轮：139 渠道已删除，这个字段**源代码里已经没有写入点**，
+         * 保留它只为不破坏旧备份/旧接口的形状（默认空串，无害）。
+         * 新增代码不要再往它赋值 —— 那会让读者以为 139 还活着。
+         */
         val fileId: String = "",
         /**
          * ★ 第 331 轮：GitHub 通道才有。
@@ -113,6 +116,11 @@ object UpdateChecker {
         val ghApkName: String = "",
         val ghMd5: String = "",
         val ghSizeKnown: Boolean = true,
+        /**
+         * ★ 第 344 轮：GitHub asset 的 sha256（API 的 digest 字段），空 = 站点没给。
+         * 有它就能在校验里做**内容级**比对，而不只是比体积。
+         */
+        val ghSha256: String = "",
     ) {
         /** 「v1.0.22 · 10.1 MB」；体积未知时如实说，不显示 0 B。 */
         val sizeText: String
@@ -125,12 +133,13 @@ object UpdateChecker {
     }
 
     /**
-     * 从哪条通道拿到的（界面如实标注，便于判断「到底走没走直连」）。
+     * 从哪条通道拿到的（界面如实标注，便于判断「这次到底走的是哪条」）。
      *
-     * ★ 第 331 轮：新增 [GITHUB] 与 [CI] 两条。四条渠道的 id 定义在
-     * [HplayUpdateChannel] 里，这里的枚举只用于界面分支。
+     * ★ 第 332 轮：[YUN139] **已删除**。渠道 id 定义在 [HplayUpdateChannel]，
+     * 这里的枚举只用于界面文案分支 —— 删掉枚举项后编译器会指出所有遗留分支，
+     * 比留着「永远走不到的分支」安全。
      */
-    enum class Via { YUN139, NETDISK, GITHUB, CI }
+    enum class Via { NETDISK, GITHUB, CI }
 
     /** 一次检查的结果。**失败必须能被区分出来**，不能与「已是最新」混为一谈。 */
     sealed class Result {
@@ -139,7 +148,7 @@ object UpdateChecker {
             val hasUpdate: Boolean get() = remote.versionCode > current
         }
 
-        /** 没取到 —— 带上人话原因（两条通道各一条）。 */
+        /** 没取到 —— 带上人话原因（每条通道各一条，或用「；」串起来）。 */
         data class Failed(val why: String) : Result()
     }
 
@@ -166,30 +175,16 @@ object UpdateChecker {
         // 不能复用 HanimeClient.http：它带 LABGLOBAL 每请求拦截器（全局挂节点），
         // builder 级 NO_PROXY 会被拦截器覆盖。这里用独立裸客户端，彻底直连。
         OkHttpClient.Builder()
+            .addInterceptor(com.han1me.log.LoggingInterceptor)
             .proxy(java.net.Proxy.NO_PROXY)
             .build()
     }
 
-    /** 取一张「本地的 Remote」，供 139 通道转换用。 */
-    private fun fromYun139(): Remote {
-        val r = Yun139.fetchManifest()
-        return Remote(
-            versionName = r.versionName,
-            versionCode = r.versionCode,
-            size = r.size,
-            md5 = r.md5,
-            notes = r.notes,
-            apk = r.apk,
-            fileId = r.fileId,
-        )
-    }
-
     /**
-     * ★ 第 331 轮：**按用户选的渠道取清单**。
+     * **按用户选的渠道取清单**（第 331 轮建立，第 332 轮去掉 139）。
      *
-     * 与旧版的区别：旧版是「先 139、再网盘」的固定串联；
-     * 现在四条渠道（139 / 网盘 / GitHub / CI）由用户在设置里指定**一条**，
-     * 一次检查只查那一条。这样「为什么没查到」永远只有一个原因，可解释。
+     * 第 332 轮：139 那条已删除，现在只有 GitHub / CI / 网盘三条。
+     * 一次检查只查**一条**渠道 ——「为什么没查到」永远只有一个原因，可解释。
      *
      * 参考依据：Han1meViewer 的 \`currentChannel()\` 也是「渠道由用户设置唯一决定」，
      * 并明确写了**不自动回落**（CI 出问题时回落到 Release 会让用户被降级到旧版）。
@@ -199,13 +194,13 @@ object UpdateChecker {
     suspend fun fetchRemote(): Result = when (HplayUpdateChannel.channel) {
         HplayUpdateChannel.CH_GITHUB -> fetchGitHub(ci = false)
         HplayUpdateChannel.CH_CI -> fetchGitHub(ci = true)
-        else -> fetchRemote139AndNetdisk()
+        else -> fetchRemoteNetdisk()
     }
 
     /**
      * **GitHub / CI 渠道**。
      *
-     * 与 139/网盘的最大语义差别：GitHub 的版本标识是 **tag 名**（lab-v1.1.70），
+     * 与网盘通道的最大语义差别：GitHub 的版本标识是 **tag 名**（lab-v1.1.70），
      * 不是 versionCode。而 [Result.Ok.hasUpdate] 比的是 versionCode。
      *
      * 所以这里把 tag 里的版本号解析成 versionCode 的等价形式再比：
@@ -250,6 +245,7 @@ object UpdateChecker {
             ghHtmlUrl = rel.htmlUrl,
             ghApkName = rel.apkName,
             ghSizeKnown = rel.sizeKnown,
+            ghSha256 = rel.apkSha256,
         )
         return Result.Ok(remote, 0, via)
     }
@@ -273,26 +269,33 @@ object UpdateChecker {
         if (remote.isBlank()) return true
         val a = parts(remote)
         val b = parts(local)
-        for (i in 0 until 3) if (a[i] != b[i]) return a[i] > b[i]
+        // ★ 第 344 轮：**按较长的一边比，缺段补 0**。
+        // 原来固定比前 3 段 —— 远端 1.1.70.1、本机 1.1.70 会被判成「已是最新」，
+        // 界面隐藏下载按钮，用户永远拿不到那个 hotfix。
+        for (i in 0 until maxOf(a.size, b.size)) {
+            val x = a.getOrElse(i) { 0 }
+            val y = b.getOrElse(i) { 0 }
+            if (x != y) return x > y
+        }
         return false
     }
 
     private fun parts(v: String): List<Int> {
         val seg = v.trim().trimStart('v', 'V').split('-').first().split('+').first().split('.')
-        return List(3) { i -> seg.getOrNull(i)?.toIntOrNull() ?: 0 }
+        // ★ 第 344 轮：不再截断成 3 段（配合 isNewer 的变长比较）。
+        return seg.map { it.toIntOrNull() ?: 0 }
     }
 
     /**
-     * 旧的固定串联链（139 → 网盘），保留给 139/网盘两个渠道。
-     * 原注释与行为**完全保留**，只是从 [fetchRemote] 里摘出来。
+     * **自建网盘渠道**（第 332 轮：从「139 → 网盘」的串联里摘出来，只留网盘）。
+     *
+     * 这一条是**垫底通道**：GitHub 与 CI 都不通时才该用它。
+     * 内部仍然是多挂载目录轮询（第 113 轮定的顺序），任一条能取到清单即用 ——
+     * 单条挂载故障不会让整条渠道失效。
      */
-    private suspend fun fetchRemote139AndNetdisk(): Result = withContext(Dispatchers.IO) {
-        val reasons = ArrayList<String>(2)
-        // ① 主通道：移动云盘 139 直连
-        runCatching { fromYun139() }
-            .onSuccess { return@withContext Result.Ok(it, currentVersionCode(), Via.YUN139) }
-            .onFailure { reasons.add("139：${it.message ?: it}") }
-        // ② 多通道链（第 113 轮，用户要求）：按优先级逐个试，任一条通即用。
+    private suspend fun fetchRemoteNetdisk(): Result = withContext(Dispatchers.IO) {
+        val reasons = ArrayList<String>(REMOTE_DIRS.size * ENDPOINTS.size)
+        // 多通道链（第 113 轮）：按优先级逐个试，任一条通即用。
         //
         // 顺序：移动云盘134（默认）→ 移动云盘195 → 天翼云盘134 → 123云盘134。
         // 每个目录先在**公网端点**试（出门也能用），失败再试内网端点。
@@ -351,8 +354,9 @@ object UpdateChecker {
      * 取 APK 的**签名直链**（有效期约 15 分钟）。
      * 界面拿到它就该立刻交给浏览器/下载器；不要缓存。
      *
-     * 139 直连优先（有 fileId 就走它），网盘兜底。**两条路都做大小校验**：
-     * 对不上就说明远端那份与清单不是同一次发布 —— 不把可疑的直链交出去。
+     * 第 332 轮：139 那条已删除，现在只有两条路 ——
+     *  · GitHub / CI：Release asset 的浏览器直链（不耗 API 限额）；
+     *  · 网盘：raw_url 签名直链，**做大小校验**（对不上说明与清单不是同一次发布）。
      */
     suspend fun apkDirectUrl(remote: Remote): String? = withContext(Dispatchers.IO) {
         // ★ 第 331 轮：GitHub / CI 渠道的清单没有 fileId，也不是网盘上的文件 ——
@@ -373,27 +377,8 @@ object UpdateChecker {
             }
             return@withContext fromWeb
         }
-        val reasons = ArrayList<String>(2)
-        // ① 139 直连
-        if (remote.fileId.isNotBlank()) {
-            runCatching {
-                val u = Yun139.apkUrl(
-                    Yun139.Remote(
-                        versionName = remote.versionName, versionCode = remote.versionCode,
-                        size = remote.size, md5 = remote.md5, notes = remote.notes,
-                        apk = remote.apk, fileId = remote.fileId,
-                    ),
-                )
-                // 真伪校验：zip 魔数 + 总长。不过就不交出去。
-                if (!Yun139.verifyApkUrl(u, remote.size)) {
-                    throw IllegalStateException("139 直链校验没过（不是 APK 或长度不符）")
-                }
-                return@withContext u
-            }.onFailure { reasons.add("139：${it.message ?: it}") }
-        } else {
-            reasons.add("139：这份清单不是从 139 拿的，没有 fileId")
-        }
-        // ② 多通道兜底（第 113 轮）：与 fetchRemote 同一优先级链
+        val reasons = ArrayList<String>(REMOTE_DIRS.size * ENDPOINTS.size)
+        // 网盘多通道（第 113 轮）：与 fetchRemoteNetdisk 同一优先级链
         for (dir in REMOTE_DIRS) {
         for (base in ENDPOINTS) {
             val r = runCatching {

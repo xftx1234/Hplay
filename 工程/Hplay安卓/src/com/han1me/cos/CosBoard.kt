@@ -92,6 +92,7 @@ object CosRepo {
     private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
     private val http by lazy {
         okhttp3.OkHttpClient.Builder()
+            .addInterceptor(com.han1me.log.LoggingInterceptor)
             .proxySelector(GlobalProxy.selector())
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(45, TimeUnit.SECONDS)
@@ -615,6 +616,7 @@ fun rememberCosPlayerController(key: String): com.han1me.player.HplayPlayerContr
     val context = androidx.compose.ui.platform.LocalContext.current
     val controller = remember(key) {
         val cosHttp = okhttp3.OkHttpClient.Builder()
+            .addInterceptor(com.han1me.log.LoggingInterceptor)
             .proxySelector(GlobalProxy.selector())
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)

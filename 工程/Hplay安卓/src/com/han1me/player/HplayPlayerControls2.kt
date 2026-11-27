@@ -88,6 +88,15 @@ fun HplayPlayerTopBar(
     visible: Boolean,
     onBack: () -> Unit,
     onSpeedClick: () -> Unit,
+    /**
+     * ★ 第 344 轮：**锁定手势**入口。
+     *
+     * 这个功能此前只有「读数」没有「写法」：HplayPlayerUiState.isGestureLocked
+     * 存在、手势层也按它分支，但全项目**没有任何一处**把它置 true ——
+     * 也就是说用户永远摸不到锁定，而那半套分支代码还是活的。
+     * 现在顶栏给出按钮，锁定后只剩悬浮的解锁键（见 HplayPlayerView2）。
+     */
+    onLock: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     AnimatedVisibility(visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
@@ -114,6 +123,8 @@ fun HplayPlayerTopBar(
                 modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(10.dp))
+            GlassButton("🔒", onLock)
+            Spacer(Modifier.width(8.dp))
             val speed = HplayPlayerDefaults.SPEEDS.getOrElse(state.speedIndex) { 1.0f }
             GlassBar {
                 Text(
@@ -221,7 +232,14 @@ fun HplayPlayerBottomBar(
             Spacer(Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 GlassButton(
-                    if (state.state == HplayPlayerState.PLAYING) "‖" else "▶",
+                    // ★ 第 344 轮：**缓冲中不该显示 ▶**。
+                    // 原来只要不是 PLAYING 就画 ▶，而缓冲时用户看到 ▶ 会以为已暂停，
+                    // 点一下也没反应（还在缓冲），完全误导。缓冲用 ⋯ 表示在等。
+                    when (state.state) {
+                        HplayPlayerState.PLAYING -> "‖"
+                        HplayPlayerState.BUFFERING, HplayPlayerState.PREPARING -> "⋯"
+                        else -> "▶"
+                    },
                     onPlayPause,
                     size = 40,
                 )

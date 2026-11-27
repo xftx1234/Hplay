@@ -81,13 +81,14 @@ class UpdateService : Service() {
                 val name = intent.getStringExtra(EXTRA_NAME).orEmpty()
                 val size = intent.getLongExtra(EXTRA_SIZE, 0L)
                 val md5 = intent.getStringExtra(EXTRA_MD5).orEmpty()
+                val sha = intent.getStringExtra(EXTRA_SHA256).orEmpty()
                 if (url.isBlank()) {
                     LabLog.i("upd", "下载请求没有 URL，忽略")
                     stopSelf()
                     return START_NOT_STICKY
                 }
                 startForeground(NOTIF_ID, buildNotification("准备下载", 0, 0, true))
-                startDownload(url, name, size, md5)
+                startDownload(url, name, size, md5, sha)
                 return START_NOT_STICKY
             }
         }
@@ -105,7 +106,7 @@ class UpdateService : Service() {
 
     // ------------------------------------------------------------------ 下载
 
-    private fun startDownload(url: String, fileName: String, expectSize: Long, expectMd5: String) {
+    private fun startDownload(url: String, fileName: String, expectSize: Long, expectMd5: String, expectSha256: String = "") {
         if (State.running) {
             LabLog.i("upd", "已有下载在跑，忽略重复请求")
             return
@@ -113,7 +114,7 @@ class UpdateService : Service() {
         State.reset(fileName.ifBlank { "update.apk" }, expectSize)
         job = scope.launch {
             try {
-                downloadWithRetry(url, expectSize, expectMd5)
+                downloadWithRetry(url, expectSize, expectMd5, expectSha256)
             } catch (c: kotlinx.coroutines.CancellationException) {
                 State.finish(false, "已取消")
                 throw c
@@ -133,7 +134,7 @@ class UpdateService : Service() {
      * 为什么按这个顺序：直连成功时最快（GitHub 的 CDN 对国内并不总是慢）；
      * 直连被墙/超时才走镜像 —— 镜像本身也要绕一圈，不该是首选。
      */
-    private suspend fun downloadWithRetry(url: String, expectSize: Long, expectMd5: String) {
+    private suspend fun downloadWithRetry(url: String, expectSize: Long, expectMd5: String, expectSha256: String = "") {
         val sources = ArrayList<String>()
         sources.add(url)
         // Release asset 的 github.com 直链可以加 gh-proxy 前缀；api 的 asset URL 不行。
@@ -152,15 +153,45 @@ class UpdateService : Service() {
             try {
                 LabLog.i("upd", "第 " + (i + 1) + "/" + sources.size + " 个源：" + src.take(120))
                 fetchOnce(src, target, expectSize)
-                // 体积与校验
+                // ★★★ 第 344 轮（全量核查 · P0）：**下载完必须验"这是不是一个 APK"**。
+                //
+                // 原来只有两道门，且都不可靠：
+                //  ① expectSize > 0 才比体积 —— Atom 兜底路径传 0（体积未知），体积检查直接跳过；
+                //  ② expectMd5 非空才校验 —— GitHub 渠道的 md5 恒为空（API 没给），整块不执行。
+                // 于是 gh-proxy 镜像回来的半截包 / HTML 错误页 / 被替换的包，都被当成"下载完成"
+                // 直接交给 ApkInstaller。用户看到安装器报"解析包时出现问题"，
+                // 应用自己却显示"下载完成"—— 这正是"更新装不上、说不清原因"的来源。
+                //
+                // 现在无条件验一道 **ZIP 魔数**（APK 是 zip，头四字节 PK 03 04）：
+                // 不是"合法 APK"的充分条件，但足以识别"这压根不是包"，成本只有 4 字节读。
+                val magic = ByteArray(4)
+                val gotN = runCatching { target.inputStream().use { it.read(magic) } }.getOrDefault(0)
+                val isZip = gotN == 4 && magic[0] == 0x50.toByte() &&
+                    magic[1] == 0x4B.toByte() && magic[2] == 0x03.toByte() && magic[3] == 0x04.toByte()
+                if (!isZip) {
+                    val sz = target.length()
+                    target.delete()
+                    throw IllegalStateException(
+                        "下载到的不是 APK（" + sz + " 字节，魔数不符）—— 该源可能返回了错误页",
+                    )
+                }
                 if (expectSize > 0 && target.length() != expectSize) {
-                    throw IllegalStateException("体积不符：期望 " + expectSize + "，实际 " + target.length())
+                    val gotSz = target.length()
+                    target.delete()
+                    throw IllegalStateException("体积不符：期望 " + expectSize + "，实际 " + gotSz)
                 }
                 if (expectMd5.isNotBlank()) {
                     val got = md5Of(target)
                     if (!got.equals(expectMd5, true)) {
                         target.delete()
                         throw IllegalStateException("校验失败（md5 不符）")
+                    }
+                }
+                if (expectSha256.isNotBlank()) {
+                    val gotSha = sha256Of(target)
+                    if (!gotSha.equals(expectSha256, true)) {
+                        target.delete()
+                        throw IllegalStateException("校验失败（sha256 不符）")
                     }
                 }
                 LabLog.i("upd", "下载完成：" + target.length() + " B -> " + target.absolutePath)
@@ -275,7 +306,15 @@ class UpdateService : Service() {
                 if (left > 0) append(" · 剩 " + left + "s")
             }
         }
-        val b = Notification.Builder(this, CHANNEL_ID)
+        // ★★★ 第 344 轮（全量核查 · P0）：同 DownloadService ——
+        // Notification.Builder(Context, String) 是 API 26 的构造，
+        // minSdk=24 在 Android 7.x 上抛 NoSuchMethodError。
+        val b = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this).setPriority(Notification.PRIORITY_LOW)
+        })
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle(if (indeterminate) "正在下载新版本" else "下载新版本 " + pct + "%")
             .setContentText(body)
@@ -389,6 +428,7 @@ class UpdateService : Service() {
         const val EXTRA_NAME = "name"
         const val EXTRA_SIZE = "size"
         const val EXTRA_MD5 = "md5"
+        const val EXTRA_SHA256 = "sha256"
 
         /**
          * gh-proxy 镜像（照 Han1mePlus 的 \`_updateMirrors\`）。
@@ -404,6 +444,7 @@ class UpdateService : Service() {
 
         private val http: OkHttpClient by lazy {
             OkHttpClient.Builder()
+                .addInterceptor(com.han1me.log.LoggingInterceptor)
                 .proxy(java.net.Proxy.NO_PROXY)
                 .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
@@ -417,27 +458,97 @@ class UpdateService : Service() {
             return base
         }
 
-        /** 已下好但还没装的包（界面用来显示「上次已下载」）。 */
-        fun pendingApk(ctx: Context): File? {
-            val f = File(updateDir(ctx), "Hplay-update.apk")
-            return if (f.isFile && f.length() > 0) f else null
+        /**
+         * 更新包文件名。
+         *
+         * ★★★ 第 344 轮（用户报「检查更新后点按钮指向残留的上一版本安装包，无法下载新版本」）：
+         *
+         * 根因是**固定文件名 + 只看文件存不存在**这一对。
+         *   · 落地名恒为 "Hplay-update.apk"（上一版留下的没被清）；
+         *   · pendingApk() 只判 `isFile && length > 0`，**完全不看版本**。
+         *
+         * 于是流程变成：查到 1.1.77 → pendingApk() 摸到 1.1.73 的残留 →
+         * 按钮直接变"立即安装已下载的包" → 点下去装的是旧包 →
+         * 用户以为更新完成，实际上永远停在旧版。
+         *
+         * 修法：文件名带上版本号（[apkName]）。不同版本各自一份，
+         * pendingApk(version) 只认**本版本**那一个，看不到旧包就不会拿它顶。
+         */
+        fun apkName(version: String): String {
+            val v = version.trim().ifBlank { "unknown" }.replace(Regex("[^0-9A-Za-z._-]"), "_")
+            return "Hplay-update-$v.apk"
         }
 
+        /**
+         * 已下好但还没装的包。
+         *
+         * @param version 目标版本号；**必须传**，否则会拿到任意历史版本的残留包
+         *   （这正是用户报的那个 bug）。少数老调用点传 null 时退化为"取最新的一个"，
+         *   只给「清理/展示」这类不需要精确版本的场景用。
+         */
+        fun pendingApk(ctx: Context, version: String? = null): File? {
+            val dir = updateDir(ctx)
+            if (version != null) {
+                val f = File(dir, apkName(version))
+                return if (f.isFile && f.length() > 0) f else null
+            }
+            // 未指定版本：取目录里最新的一个 update 包（按 mtime）
+            return runCatching {
+                dir.listFiles { f ->
+                    f.isFile && f.name.startsWith("Hplay-update") && f.name.endsWith(".apk") &&
+                        f.length() > 0
+                }?.maxByOrNull { it.lastModified() }
+            }.getOrNull()
+        }
+
+        /** 删掉**所有**历史更新包（不是只删当前这一个 —— 那正是残留的来源）。 */
         fun deletePending(ctx: Context) {
-            runCatching { File(updateDir(ctx), "Hplay-update.apk").delete() }
+            runCatching {
+                updateDir(ctx).listFiles { f ->
+                    f.isFile && f.name.startsWith("Hplay-update") && f.name.endsWith(".apk")
+                }?.forEach { runCatching { it.delete() } }
+            }
+        }
+
+        /**
+         * 清理与目标版本无关的旧包。
+         *
+         * 下完/装完一次就调一次：只留目标版本那一个，其余全删。
+         * 一个 24 MB 的包攒几个就上百 MB，而且下次还会被 pendingApk 误认。
+         */
+        fun sweepOldPacks(ctx: Context, keepVersion: String?) {
+            val keep = keepVersion?.let { apkName(it) }
+            runCatching {
+                updateDir(ctx).listFiles { f ->
+                    f.isFile && f.name.startsWith("Hplay-update") && f.name.endsWith(".apk") &&
+                        f.name != keep
+                }?.forEach { runCatching { it.delete() } }
+            }
         }
 
         /** 开下（幂等：已经在跑就不再起一个）。 */
-        fun start(ctx: Context, url: String, name: String, size: Long, md5: String = "") {
+        /**
+         * 开下。
+         *
+         * @param version 目标版本号（**必传**）。落地文件名由它决定（见 [apkName]），
+         *   同时先把**这个版本之外**的旧包扫掉 —— 否则 24 MB × N 会越攒越多，
+         *   下次还会被 pendingApk 误认成"已下载"（用户报的那个 bug）。
+         */
+        fun start(ctx: Context, url: String, name: String, size: Long, md5: String = "", sha256: String = "",
+                  version: String = "") {
             if (State.running) return
+            // 只留目标版本，其余旧包一律清掉
+            if (version.isNotBlank()) sweepOldPacks(ctx, version)
             val i = Intent(ctx, UpdateService::class.java).apply {
                 action = ACTION_DOWNLOAD
                 putExtra(EXTRA_URL, url)
-                // 固定文件名：GitHub 的 asset 名带版本号，但我们只保留「最新一版」，
-                // 免得旧包越攒越多（用户不会想清理这些）。
-                putExtra(EXTRA_NAME, "Hplay-update.apk")
+                // ★ 第 344 轮：文件名带版本号，不再固定成 "Hplay-update.apk"。
+                // 固定名会让"上一个版本的残留包"和"这次要下的包"撞在一起，
+                // pendingApk 又只看存不存在 —— 于是按钮指向旧包。
+                putExtra(EXTRA_NAME, if (version.isBlank()) "Hplay-update.apk" else apkName(version))
                 putExtra(EXTRA_SIZE, size)
                 putExtra(EXTRA_MD5, md5)
+                putExtra(EXTRA_SHA256, sha256)
             }
             runCatching {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
@@ -455,6 +566,20 @@ class UpdateService : Service() {
             n >= 1048576L -> "%.1f MB".format(n / 1048576.0)
             n >= 1024L -> "%.0f KB".format(n / 1024.0)
             else -> n.toString() + " B"
+        }
+
+        /** sha256（第 344 轮：GitHub asset 的 digest 是 sha256，md5 空时靠它做内容级校验）。 */
+        fun sha256Of(f: File): String {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            f.inputStream().use { ins ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n <= 0) break
+                    md.update(buf, 0, n)
+                }
+            }
+            return md.digest().joinToString("") { "%02x".format(it) }
         }
 
         fun md5Of(f: File): String {

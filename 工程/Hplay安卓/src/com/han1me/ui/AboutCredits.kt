@@ -2,6 +2,10 @@ package com.han1me.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.Alignment
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -141,12 +145,48 @@ val HPLAY_SITES: List<Pair<String, String>> = listOf(
     "missav.com" to "三次元板块",
 )
 
+/**
+ * **引用与致谢全屏页**（第 332 轮）。
+ *
+ * 原来它是一段塞在关于页中间的长列表（滚到底才能看完），改成独立一层：
+ *  · 关于页保持「一屏看全」的信息密度（照 Han1meViewer 的分组结构）；
+ *  · 想看引用的人点「引用与致谢」进来，这里是完整清单，可以慢慢看、逐个点开。
+ *
+ * 由 MainActivity 在 [HplayAboutState.showCredits] 为真时覆盖显示
+ * （与更新面板同级，这样它能盖住设置页，系统返回也能正常退出）。
+ */
+@Composable
+fun AboutCreditsPage(onClose: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Column(
+        Modifier.fillMaxSize()
+            .background(cs.background)
+            .verticalScroll(rememberScrollState())
+            .padding(bottom = 24.dp),
+    ) {
+        // 返回栏（与设置页其它子页同款）
+        Row(
+            Modifier.fillMaxWidth().height(52.dp).padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "‹",
+                color = cs.onSurface, fontSize = 26.sp,
+                modifier = Modifier.clip(RoundedCornerShape(18.dp))
+                    .clickable { onClose() }.padding(horizontal = 14.dp, vertical = 2.dp),
+            )
+            Text("引用与致谢", color = cs.onSurface, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+        }
+        AboutCreditsSection()
+    }
+}
+
 @Composable
 fun AboutCreditsSection() {
     val cs = MaterialTheme.colorScheme
     val ctx = LocalContext.current
 
-    CreditsSectionTitle("引用与致谢")
+    CreditsSectionTitle("参考项目")
 
     // 一句话说清「这个工程是什么」，因为它是理解下面所有引用的前提。
     Text(
