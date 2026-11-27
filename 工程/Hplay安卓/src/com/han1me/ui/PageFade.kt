@@ -13,7 +13,7 @@ import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.launch
 
 /**
- * 页面淡入 + 位移动画（第 56 轮起；第 339 轮重做，用户要求「优化全局应用流畅转场动画」）。
+ * 页面淡入 + 位移动画（第 56 轮起；第 339 轮重做；**第 348 轮按参考源码再校准**）。
  *
  * ## 为什么不用 Crossfade / AnimatedContent
  *
@@ -22,20 +22,27 @@ import kotlinx.coroutines.launch
  * 那次把整个 tab 树吞进了 sites 分支）。
  * 所以做成**单行 Modifier 扩展**：调用点只改一行，不产生新的大括号。
  *
- * ## 第 339 轮改了什么（用户报「转场动画要更流畅」）
+ * ## 第 348 轮改了什么
  *
- * 旧版只有 alpha 0.55 -> 1，160ms。三个问题：
- *  · 纯淡入**没有方向感**，切换看起来是平的，用户感觉不到层级变化；
- *  · 160ms 在高刷屏上只有 9~19 帧，加速曲线来不及铺开就被截断；
- *  · 每帧重建 alpha 图层（旧版用 Modifier.alpha）。
+ * 上一版是「alpha 0.62->1（200ms）+ 上移 8dp->0（220ms）」。
+ * 对着两个参考源码核了一遍，发现两处不一致：
  *
- * 现在：
- *  · **alpha + 轻微上位移**（8dp -> 0）：有方向感但仍克制，符合 Material 3 的
- *    emphasized decelerate 语义，不会像滑动转场那样抢注意力；
- *  · 220ms + LinearOutSlowIn（前快后慢）：到位更快，尾巴更柔，
- *    比 FastOutSlowIn 更适合内容出现这类一次性动画；
- *  · 全程 graphicsLayer（GPU 合成，不重建图层）；
- *  · 动画期把窗口帧率提到面板上限（见 HplayFrameRate），结束后交还系统。
+ * 1. **有位移，但它们都没有**。
+ *    Viewer 的 AnimatedLazy（列表项）明确只做 alpha + scale，不做 translation ——
+ *    它注释里写的原因是对的：位移会和滚动方向抢视觉，用户分不清"是我在滑"还是"页面在动"。
+ *    Plus 连 alpha 都没有，是瞬切。
+ *    本轮把位移去掉，改成 Viewer 那套 **alpha + scale(0.985->1)**：
+ *    位移为 0，观感是"内容在原位轻轻落定"，比"从下往上飘"干净得多，也少一个属性要合成。
+ *
+ * 2. **时长不对**。
+ *    Viewer 是 alpha 100ms / scale 180ms。上一版 200/220ms，慢了近一倍，
+ *    高刷屏上反而显得拖。本轮照抄 100/180。
+ *
+ * ## 省电
+ *
+ *  · 全程 graphicsLayer（alpha + scaleX/Y 都是合成层属性），不触发重排重绘；
+ *  · 时长过 HplayMotion.ms()：系统关掉动画时长为 0，一帧不画；
+ *  · 动画期把窗口帧率提到面板上限，结束立刻交还（见 HplayFrameRate）。
  *
  * @param key 视图标识（board/tab/mode 拼起来）。它一变就重放一次淡入。
  */
@@ -44,26 +51,37 @@ fun Modifier.pageFade(key: Any): Modifier {
     val ctx = LocalContext.current
     val act = remember(ctx) { com.han1me.player.HplayOrientation.activityOf(ctx) }
     val a = remember { Animatable(1f) }
-    val ty = remember { Animatable(0f) }
+    val s = remember { Animatable(1f) }
     LaunchedEffect(key) {
         // 动画期间用面板上限帧率；结束立刻交还（省电，不常驻高刷）
         HplayFrameRate.beginAnimation(act)
-        a.snapTo(0.62f)      // 不从全透明起：视觉上更快到位，也不闪白
-        ty.snapTo(8f)
+        a.snapTo(0f)                       // 照 Viewer：从**全透明**起，不是 0.62
+        s.snapTo(HplayMotion.ITEM_SCALE_FROM)
         try {
-            // 两条同时跑：alpha 稍快收尾，位移稍慢铺开，观感更自然
+            // 两条同时跑：alpha 快、scale 慢（Viewer 就是这么配的，100 / 180）
             kotlinx.coroutines.coroutineScope {
-                launch { a.animateTo(1f, tween(200, easing = LinearOutSlowInEasing)) }
-                launch { ty.animateTo(0f, tween(220, easing = FastOutSlowInEasing)) }
+                launch {
+                    a.animateTo(
+                        1f,
+                        tween(HplayMotion.ms(HplayMotion.ITEM_ALPHA), easing = LinearOutSlowInEasing),
+                    )
+                }
+                launch {
+                    s.animateTo(
+                        1f,
+                        tween(HplayMotion.ms(HplayMotion.ITEM_SCALE), easing = FastOutSlowInEasing),
+                    )
+                }
             }
         } finally {
             HplayFrameRate.endAnimation(act)
         }
     }
     val v = a.value
-    val offset = ty.value
+    val sc = s.value
     return this.graphicsLayer {
         alpha = v
-        translationY = offset
+        scaleX = sc
+        scaleY = sc
     }
 }

@@ -57,6 +57,8 @@ class MainActivity : ComponentActivity() {
         // 用户登录成功返回后主界面仍显示「未登录」。
         // onResume 必然在返回时触发，这里主动读磁盘比对。
         runCatching { com.han1me.lab.LoginState.syncFromDisk() }
+        // ★ 第 348 轮：用户可能去开发者选项把动画关掉了再回来 —— 重读一次。
+        runCatching { com.han1me.ui.HplayMotion.refresh(this) }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,6 +72,9 @@ class MainActivity : ComponentActivity() {
         // ★★ 实验分叉（2026-10-30）：初始化内置节点（节点链接/开关/自动恢复）。
         // 这是实验版对主线文件的**唯一一处**运行时改动，便于日后合并。
         com.han1me.lab.LabInit.initOnce(this, HplayEnv.dataDir())
+        // ★ 第 348 轮：动画缩放读取放在 LabInit 之后 —— 那里 LabLog 才 attach，
+        // 否则这一行日志会丢（HplayFrameRate 的日志就一直是丢的）。
+        com.han1me.ui.HplayMotion.init(this)
         // 第 46 轮「外部播放器」：本机下载条目点这个键时交给系统播放器。
         // 走 FileProvider 的 content://（见 HplayEnv.playExternalFile 的注释）；
         // 调不起来就明确提示，不让用户点了没反应。

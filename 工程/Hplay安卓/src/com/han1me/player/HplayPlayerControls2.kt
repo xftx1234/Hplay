@@ -1,6 +1,7 @@
 package com.han1me.player
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
@@ -103,7 +104,14 @@ fun HplayPlayerTopBar(
     rotateHint: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    AnimatedVisibility(visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
+    AnimatedVisibility(
+        visible,
+        // ★ 第 348 轮：显隐给固定时长（参考 Viewer 的默认 spring 约合 200ms；
+        // Plus 是瞬切，太生硬）。走 HplayMotion 后系统关动画时长为 0。
+        enter = fadeIn(animationSpec = tween(com.han1me.ui.HplayMotion.ms(com.han1me.ui.HplayMotion.CONTROL_FADE))),
+        exit = fadeOut(animationSpec = tween(com.han1me.ui.HplayMotion.ms(com.han1me.ui.HplayMotion.CONTROL_FADE))),
+        modifier = modifier,
+    ) {
         Row(
             Modifier
                 .fillMaxWidth()
@@ -166,7 +174,14 @@ fun HplayPlayerBottomBar(
     onFullscreen: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    AnimatedVisibility(visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
+    AnimatedVisibility(
+        visible,
+        // ★ 第 348 轮：显隐给固定时长（参考 Viewer 的默认 spring 约合 200ms；
+        // Plus 是瞬切，太生硬）。走 HplayMotion 后系统关动画时长为 0。
+        enter = fadeIn(animationSpec = tween(com.han1me.ui.HplayMotion.ms(com.han1me.ui.HplayMotion.CONTROL_FADE))),
+        exit = fadeOut(animationSpec = tween(com.han1me.ui.HplayMotion.ms(com.han1me.ui.HplayMotion.CONTROL_FADE))),
+        modifier = modifier,
+    ) {
         Column(
             Modifier
                 .fillMaxWidth()

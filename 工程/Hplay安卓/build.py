@@ -375,6 +375,22 @@ def upstream():
         print("  [UI 微调] 异常：" + repr(_e))
         raise SystemExit("[UI 微调未通过] 构建已中止")
 
+    # 第 348 轮：**动画校准 + 关注即时化**（规则在 tools/round348.py）。
+    #
+    # 为什么单独一个阶段：postpatch.py 已经 2800+ 行，本轮改动再加进去
+    # 会让 diff 完全看不出改了什么。这个模块只此四件事：
+    #   关注按钮乐观更新 / 详情页预热 WebView / 列表项入场动画 / tab 方向转场 / 轻提示进出。
+    # 放在 uifinetune 之后：本轮要替换的 tab transitionSpec 与 toast 块都是 uifinetune
+    # 之后才最终定形的（uifinetune 会重排 tab 分支的缩进）。
+    _r348 = subprocess.run([sys.executable, str(ROOT / "tools" / "round348.py")],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+    for line in (_r348.stdout or "").splitlines():
+        if line.strip():
+            print(line)
+    if _r348.returncode != 0:
+        sys.stdout.write(_r348.stderr or "")
+        raise SystemExit("[第348轮规则未通过] 构建已中止")
+
     # ★★★ 第 334 轮：**日志拦截器接线**（gen + src 两处都要）。
     #
     # 全项目 14 个 OkHttpClient.Builder（gen 8 + src 6），逐个手改不可维护。

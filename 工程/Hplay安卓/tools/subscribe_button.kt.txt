@@ -1,0 +1,45 @@
+                        if (ar.canSubscribe) {
+                            val subbed = remember(ar.artistId, ar.isSubscribed) { mutableStateOf(ar.isSubscribed) }
+                            // ★ 第 348 轮：**乐观更新**。按下瞬间就翻转，不等网络；失败再翻回来。
+                            //
+                            // 原来要等 toggle() 返回才改 subbed.value，于是从点击到按钮变色中间
+                            // 隔着一整趟 WebView 提交（第 347 轮实测 4-7 秒）。用户报的「点了卡几秒」
+                            // 一半是这段时间的空白感 —— 按钮没反应，用户以为没点中，就再点一次。
+                            //
+                            // 现在：立刻翻 -> 后台提交 -> 成功则用站点返回值校正，失败则翻回原值并提示。
+                            // 用独立的 subBusy 而不是全局面板那个 busy：后者会连收藏/稍后看按钮一起禁用。
+                            var subBusy by remember(ar.artistId) { mutableStateOf(false) }
+                            val want = !subbed.value
+                            Text(
+                                if (subbed.value) "已关注" else "关注",
+                                color = Color.White, fontSize = 12.sp,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(15.dp))
+                                    .background(if (subbed.value) CardColorSoft else AccentRed)
+                                    .clickable(enabled = !subBusy) {
+                                        subBusy = true
+                                        val before = subbed.value
+                                        subbed.value = want   // 立即翻转：这一帧就变色
+                                        scope.launch(Dispatchers.IO) {
+                                            try {
+                                                val now = com.han1me.lab.HplaySubscribe.toggle(
+                                                    d.video.url,
+                                                    ar.userId, ar.artistId, want,
+                                                )
+                                                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                                    subbed.value = now
+                                                    onToast(if (now) "已关注 ${ar.name}" else "已取消关注")
+                                                }
+                                            } catch (t: Throwable) {
+                                                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                                    subbed.value = before   // 回滚：不留假状态
+                                                    onToast("关注没成功：" + (t.message ?: "未知原因"))
+                                                }
+                                            } finally {
+                                                subBusy = false
+                                            }
+                                        }
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                            )
+                        }
