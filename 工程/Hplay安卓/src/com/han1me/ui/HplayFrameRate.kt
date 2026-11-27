@@ -76,26 +76,75 @@ object HplayFrameRate {
         return best
     }
 
-    /** 动画/滚动开始：把窗口的首选刷新率提到目标值。 */
+    /**
+     * 当前已应用的首选刷新率（0 = 未设置）。
+     *
+     * ★★★ 第 349 轮修（真机 gfxinfo 抓到的掉帧源）：
+     * 赋值 `act.window.attributes = lp` 会让 WindowManager **重新布局整个窗口** ——
+     * 而这行原来在**每一次页面转场开始时**都执行（pageFade 的 LaunchedEffect key 一变就跑）。
+     * 于是"切页面"的第一帧永远在重排窗口，恰好是转场最需要帧预算的那一刻。
+     *
+     * 现在用 appliedHz 记住已生效的值，**值没变就直接返回**。
+     * 60Hz 屏（targetHz == 0）连这次调用都不会进来。
+     */
+    @Volatile
+    private var appliedHz = 0f
+
+    /** 动画/滚动开始：把窗口的首选刷新率提到目标值（幂等，值没变不碰窗口）。 */
     fun beginAnimation(activity: Activity?) {
         val act = activity ?: return
         val hz = targetHz
         if (hz <= 0f) return
+        if (appliedHz == hz) return
         runCatching {
             val lp = act.window.attributes
             lp.preferredRefreshRate = hz
             act.window.attributes = lp
+            appliedHz = hz
         }
     }
 
-    /** 动画结束：置 0 交还系统（省电，不常驻高刷）。 */
+    /** 动画结束：置 0 交还系统（省电，不常驻高刷）。幂等。 */
     fun endAnimation(activity: Activity?) {
         val act = activity ?: return
         if (targetHz <= 0f) return
+        if (appliedHz == 0f) return
         runCatching {
             val lp = act.window.attributes
             lp.preferredRefreshRate = 0f
             act.window.attributes = lp
+            appliedHz = 0f
+        }
+    }
+
+    // ---------------- 持续高帧（第 349 轮：循环动画用） ----------------
+    //
+    // 上面那对 begin/end 是「一次性动画」用的（进入时抬、结束就交还）。
+    // 加载图标是**无限循环**的，它在组合里期间要一直吃满帧率；
+    // 但屏幕上有好几个加载图标（首屏卡片、翻页脚、详情转圈）时，
+    // 谁先结束就把帧率交还了 —— 于是后面的动画掉回 60。
+    //
+    // 用引用计数解决：pushLoop/popLoop 成对出现，最后一个走的时候才交还。
+    // 用户本轮明确「不考虑耗电，要不掉帧」，所以这里是刻意的常驻高帧。
+
+    @Volatile
+    private var loopHolders = 0
+
+    private val mainH = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /** 循环动画进场：计数 +1，并把帧率抬到上限。 */
+    fun pushLoop() {
+        mainH.post {
+            loopHolders++
+            if (loopHolders == 1) beginAnimation(com.han1me.HplayEnv.activity())
+        }
+    }
+
+    /** 循环动画离场：计数 -1，归零才交还帧率。 */
+    fun popLoop() {
+        mainH.post {
+            if (loopHolders > 0) loopHolders--
+            if (loopHolders == 0) endAnimation(com.han1me.HplayEnv.activity())
         }
     }
 }

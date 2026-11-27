@@ -397,11 +397,8 @@ fun HplayPlayerView2(
                     .background(Color.Black.copy(alpha = 0.5f)),
                 contentAlignment = Alignment.Center,
             ) {
-                androidx.compose.material3.CircularProgressIndicator(
-                    modifier = Modifier.size(24.dp),
-                    color = androidx.compose.material3.MaterialTheme.colorScheme.primary,
-                    strokeWidth = 2.dp,
-                )
+                // ★ 第 349 轮：缓冲指示也换成跳动图标（用户要求「所有页面的加载图标」）
+                com.han1me.ui.HplayLoadMark(markSize = 26.dp)
             }
         }
 

@@ -30,7 +30,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -328,7 +327,7 @@ fun CosBoardScreen(onBack: () -> Unit, cosFavOpen: CosRepo.Post? = null, onCosFa
             }
         }
         if (loading && posts.isEmpty()) {
-            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = CosAccent) }
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { com.han1me.ui.HplayLoadMark(markSize = 34.dp) }
         } else if (err.isNotBlank() && posts.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -386,7 +385,7 @@ fun CosBoardScreen(onBack: () -> Unit, cosFavOpen: CosRepo.Post? = null, onCosFa
                 item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(2) }) {
                     Box(Modifier.fillMaxWidth().padding(10.dp), contentAlignment = Alignment.Center) {
                         when {
-                            loading -> CircularProgressIndicator(color = CosAccent, modifier = Modifier.size(22.dp))
+                            loading -> com.han1me.ui.HplayLoadMark(markSize = 20.dp)
                             exhausted -> Text("没有更多了", color = CosFaint, fontSize = 12.sp)
                             else -> Text("加载更多 ↓", color = Color.White, fontSize = 13.sp,
                                 modifier = Modifier.clip(RoundedCornerShape(18.dp)).background(CosCard)
@@ -510,7 +509,7 @@ fun CosPostScreen(post: CosRepo.Post, onBack: () -> Unit) {
             )
         }
         when {
-            loading -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = CosAccent) }
+            loading -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { com.han1me.ui.HplayLoadMark(markSize = 34.dp) }
             err.isNotBlank() -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(err, color = CosFaint, fontSize = 13.sp)
@@ -538,7 +537,7 @@ fun CosPostScreen(post: CosRepo.Post, onBack: () -> Unit) {
                 if (post.video) {
                     if (resolving) {
                         Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-                            CircularProgressIndicator(color = CosAccent, modifier = Modifier.size(18.dp))
+                            com.han1me.ui.HplayLoadMark(markSize = 17.dp)
                             Spacer(Modifier.width(10.dp))
                             Text("正在解析视频直链…", color = CosFaint, fontSize = 13.sp)
                         }

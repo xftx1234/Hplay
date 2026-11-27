@@ -720,12 +720,33 @@ def stage_res():
     if not assets.is_dir():
         assets.mkdir(parents=True, exist_ok=True)
     shutil.copy2(AVPLAY / "独立版" / "hplay-adrules.txt", assets / "hplay-adrules.txt")
+    # ★ 第 349 轮：**加载图标资源**。本工程手搓管线不给 app 包生成 R 类
+    # （gen_r() 刻意排除 PACKAGE，见那里注释），所以 drawable 里的图在代码里
+    # 拿不到 R.drawable.xxx —— 只能走 assets，用 assets.open() 读。
+    # 源图在 工程/Hplay安卓/assets/load/，拷到 build/assets/ 供 aapt2 -A 打包。
+    _load_dir = ROOT / "assets" / "load"
+    if _load_dir.is_dir():
+        for _f in sorted(_load_dir.glob("*")):
+            if _f.is_file() and not _f.name.startswith("."):
+                # 三个坑叠在一起（第 349 轮实测踩到）：
+                #  · copy2 会把源文件的**只读位**一起带过去 → 下次覆盖 PermissionError；
+                #  · 目标已存在且是只读 → 连 copyfile 也 PermissionError；
+                #  · 所以先删目标、再 copyfile，源侧只读不影响读取。
+                _dst = assets / _f.name
+                if _dst.exists():
+                    try:
+                        os.chmod(str(_dst), stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
+                    _dst.unlink()
+                shutil.copyfile(_f, _dst)
     # ★ 2026-11-25（第 294 轮）：背景图改用 res/drawable，**不再走 assets**。
     #
     # 原因：assets 里的 app_bg.jpg 在 Windows 上反复被 aapt2 句柄占着，
     # copy2 / rmtree / rename 三种方式都试过，都会 PermissionError 或路径失效。
     # drawable 走资源编译管线，根本没有"按名覆盖同名文件"这一步 —— 干净得多。
-    print(f"  {len(dirs)} 个 res 目录（{n} 文件）；assets: hplay-adrules.txt")
+    _load_n = len([x for x in (ROOT / "assets" / "load").glob("*") if x.is_file()]) if (ROOT / "assets" / "load").is_dir() else 0
+    print(f"  {len(dirs)} 个 res 目录（{n} 文件）；assets: hplay-adrules.txt + 加载图标 {_load_n} 个")
 
 
 @step("10. 注入 dex 与 META-INF/services")

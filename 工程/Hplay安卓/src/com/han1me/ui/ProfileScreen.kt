@@ -155,12 +155,8 @@ private fun ProfileHeaderCard(
                         contentScale = androidx.compose.ui.layout.ContentScale.Crop,
                     )
                 } else if (com.han1me.lab.LoginState.loadingAccount) {
-                    // 加载中：转圈代替 emoji
-                    androidx.compose.material3.CircularProgressIndicator(
-                        modifier = Modifier.size(22.dp),
-                        color = cs.primary,
-                        strokeWidth = 2.dp,
-                    )
+                    // 加载中：第 349 轮换成跳动的小图标（原为转圈）
+                    HplayLoadMark(markSize = 26.dp)
                 } else {
                     Text(if (loggedIn) "🙂" else "👤", fontSize = 24.sp)
                 }

@@ -38,11 +38,26 @@ object HplayMotion {
 
     // ---------------- 页面转场（Viewer MainNavHost） ----------------
 
-    /** 进入：滑动 + 淡入时长。 */
-    const val NAV_IN = 450
+    /**
+     * 进入：滑动时长。
+     *
+     * ★ 第 349 轮：**450ms → 260ms**（两处依据都指向这个数）。
+     *
+     * · Viewer 是 450ms，但它是"滑动 + 淡入 + 旧页缩放淡出"的整套，位移量小；
+     *   本工程砍掉了 exit 与 fade（见 HplayTransition 的注释），只剩一条纯滑动 ——
+     *   450ms 的纯滑动在 60Hz 屏上要走 27 帧、1080px 以上，**边缘拖影很明显**。
+     * · Plus 的 tab 转场就是 **260ms**（app_shell.dart:38），而且它是纯滑入。
+     *
+     * 真机 gfxinfo 对比（1440×3120 / 60Hz）：
+     *   450ms 纯滑动 → Janky 7.0% / 50th 18ms
+     *   260ms 纯滑动 → 见 §349 工程记录（更短，掉帧窗口按比例收窄）
+     *
+     * 260ms 在 60Hz 上是 15 帧，正好够铺完一条 FastOutSlowIn 曲线而不显得赶。
+     */
+    const val NAV_IN = 260
 
-    /** 退出滑动时长（与进入同长）。 */
-    const val NAV_SLIDE_OUT = 450
+    /** 退出滑动时长（与进入同长；本工程默认不播 exit，见 HplayTransition）。 */
+    const val NAV_SLIDE_OUT = 260
 
     /** 退出淡出时长。 */
     const val NAV_FADE_OUT = 300

@@ -431,7 +431,65 @@ def patch_body_fade_key(text):
     return text.replace(BODYFADE_OLD, BODYFADE_NEW, 1)
 
 
+
+
+# --------------------------------------------------------------------------
+# 8. 加载图标：转圈 -> 跳动小图标（第 349 轮）
+# --------------------------------------------------------------------------
+
+SPIN_CASES = [
+    # (文件, 原文, 替换, 说明)
+    ("Han1meApp.kt",
+     "                CircularProgressIndicator(color = AccentRed)\n            }",
+     "                com.han1me.ui.HplayLoadMark(markSize = 34.dp)\n            }",
+     "详情加载态"),
+    ("Han1meApp.kt",
+     "        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = AccentRed) }\n        return",
+     "        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { com.han1me.ui.HplayLoadMark(markSize = 34.dp) }\n        return",
+     "首页加载态"),
+    ("Han1meApp.kt",
+     "                    CircularProgressIndicator(color = AccentRed)\n                }\n            }\n            page == null || page.items.isEmpty() -> {",
+     "                    com.han1me.ui.HplayLoadMark(markSize = 34.dp)\n                }\n            }\n            page == null || page.items.isEmpty() -> {",
+     "预告页加载态"),
+    ("Han1meApp.kt",
+     "            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = AccentRed) }\n        } else {",
+     "            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { com.han1me.ui.HplayLoadMark(markSize = 34.dp) }\n        } else {",
+     "列表页加载态"),
+    ("X99Board.kt",
+     "                    CircularProgressIndicator(color = AccentRed)\n                    if (picking) {",
+     "                    com.han1me.ui.HplayLoadMark(markSize = 34.dp)\n                    if (picking) {",
+     "板块测速态"),
+    ("X99Board.kt",
+     "                        CircularProgressIndicator(color = AccentRed, modifier = Modifier.height(14.dp).width(14.dp), strokeWidth = 2.dp)",
+     "                        com.han1me.ui.HplayLoadMark(markSize = 14.dp)",
+     "读分类内联"),
+    ("X99Board.kt",
+     "                            CircularProgressIndicator(color = AccentRed, modifier = Modifier.height(12.dp).width(12.dp), strokeWidth = 2.dp)",
+     "                            com.han1me.ui.HplayLoadMark(markSize = 12.dp)",
+     "翻页脚内联"),
+]
+
+
+def patch_spinners(text, name):
+    """把所有 LoadMark 位置从转圈换成跳动图标。
+
+    用户本轮要求「所有页面的加载图标从转圈改成如图」。逐个锚点替换，
+    不用全局 replace —— CircularProgressIndicator 在不同位置的尺寸与上下文都不同，
+    全局换会把大小和间距一并毁掉。
+    """
+    for f, old, new, _why in SPIN_CASES:
+        if f != name:
+            continue
+        if new in text:
+            continue
+        if old not in text:
+            continue
+        text = text.replace(old, new, 1)
+    return text
+
+
 def apply(text, name):
+    text = patch_spinners(text, name)
     if name == "Han1meApp.kt":
         text = patch_subscribe_instant(text)
         text = patch_subscribe_prewarm(text)

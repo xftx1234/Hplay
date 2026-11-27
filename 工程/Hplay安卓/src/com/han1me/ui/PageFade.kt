@@ -6,6 +6,8 @@ import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
@@ -50,10 +52,18 @@ import kotlinx.coroutines.launch
 fun Modifier.pageFade(key: Any): Modifier {
     val ctx = LocalContext.current
     val act = remember(ctx) { com.han1me.player.HplayOrientation.activityOf(ctx) }
+    var settled by remember(key) { androidx.compose.runtime.mutableStateOf(false) }
     val a = remember { Animatable(1f) }
     val s = remember { Animatable(1f) }
     LaunchedEffect(key) {
-        // 动画期间用面板上限帧率；结束立刻交还（省电，不常驻高刷）
+        // ★★★ 第 349 轮（gfxinfo 实测 50th 29ms，掉帧）：**动画值为 1 时不要开图层**。
+        //
+        // 上一版无条件返回 this.graphicsLayer{...}，于是整块内容（含整个 LazyGrid）
+        // 永远挂在一个 RenderNode 上 —— 即使动画早跑完、alpha 恒为 1。
+        // 那一层会让列表的每张卡片都先合成到离屏层再贴回来，
+        // 纯滚动时 GPU 时间就从 8ms 涨到 13ms（预算 16.67ms）。
+        //
+        // 现在用 done 标记：动画跑完把图层整个摘掉。done 只翻转一次 → 只重组一次。
         HplayFrameRate.beginAnimation(act)
         a.snapTo(0f)                       // 照 Viewer：从**全透明**起，不是 0.62
         s.snapTo(HplayMotion.ITEM_SCALE_FROM)
@@ -75,12 +85,22 @@ fun Modifier.pageFade(key: Any): Modifier {
             }
         } finally {
             HplayFrameRate.endAnimation(act)
+            settled = true          // 图层摘掉：之后这块内容就是普通的直接绘制
         }
     }
-    val v = a.value
-    val sc = s.value
+    if (settled) return this
+    // ★★★ 第 349 轮（用户要求「不掉帧」）：**不能在组合期读动画值**。
+    //
+    // 上一版写的是 val v = a.value; val sc = s.value; 然后 graphicsLayer { alpha = v } ——
+    // 这句话看着无害，实际上 a.value 是在**组合阶段**读的：
+    // 每帧一次 state 读取 → 本作用域每帧重组 → 整棵内容子树每帧重组。
+    // 60fps 下等于每秒 60 次重组，120fps 下 120 次 —— 这就是"切页面卡一下"的来源。
+    //
+    // 正解：把读取留在 graphicsLayer 的 lambda 里。那个 lambda 由**绘制阶段**调用，
+    // 每帧只重绘一个图层，跳过组合与布局（Compose 官方的 defer state reads）。
     return this.graphicsLayer {
-        alpha = v
+        alpha = a.value
+        val sc = s.value
         scaleX = sc
         scaleY = sc
     }

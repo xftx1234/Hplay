@@ -213,14 +213,17 @@ fun HplayEmpty(
     }
 }
 
-/** 加载中。 */
+/**
+ * 加载中。
+ *
+ * ★ 第 349 轮（用户要求「所有页面的加载图标从转圈改成如图」）：
+ * 转圈换成**小幅度跳动的角色图标**（见 ui/HplayLoadingMark.kt）。
+ * 动画全部在 graphicsLayer 里读值，不触发重组 —— 换掉转圈的另一个原因是
+ * CircularProgressIndicator 自己就是一条无限动画 + 每帧 Arc 重绘，两个一起跑反而更重。
+ */
 @Composable
 fun HplayLoading(modifier: Modifier = Modifier) {
     Box(modifier.fillMaxWidth().padding(vertical = 40.dp), contentAlignment = Alignment.Center) {
-        CircularProgressIndicator(
-            modifier = Modifier.size(22.dp),
-            color = MaterialTheme.colorScheme.primary,
-            strokeWidth = 2.dp,
-        )
+        HplayLoadMark(markSize = 34.dp)
     }
 }
