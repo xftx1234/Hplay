@@ -2941,7 +2941,21 @@ object HplayDownloads {
             // 这里原来硬性 coerceIn(4, 8) —— 即使用户把并发设成 16，单文件下载也只跑 8 路，
             // 而 CONC_DEFAULT 早已是 16、连接池也已放大到 64/48，8 路明显吃不满带宽。
             // 现在跟随 CONC_DEFAULT（仍保留 4 的下限与 16 的上限，以及按域失败自动降级）。
+            // ★★★ 第 354 轮（用户报「javchu 下载也是断崖式下降」）：**把「自动降级」真正接上**。
+            //
+            // 上面那句注释（第 133 轮写的）一直说「连续失败就降一级」，但代码里
+            // `segFailByHost` **只有定义和一次 remove，从来没被赋值** —— 这条降级从写下那天起
+            // 就没生效过。
+            //
+            // 本轮日志把后果暴露得很彻底：32 路持续打 t33.cdn2020.com，最后 60 秒出现
+            // **123 次 SSLHandshakeException**（CDN 握手队列被打满、开始拒新连接），
+            // 而并发一次都没降 —— 一直拿 32 路去撞同一堵墙，越撞越慢，这就是「断崖」。
+            //
+            // 现在：**上一次**该域留下过 SSL 降级记录，这一次就按降过的档位跑：
+            //   32 → 16 → 8（下限 8；再低吃不满带宽，宁可慢也别卡死）。
             val n = learned.coerceIn(4, MAX_CONCURRENCY)
+            // 第 354 轮：本次任务的 SSL 握手失败计数（任务结束时据此决定是否降档）
+            val sslFails = java.util.concurrent.atomic.AtomicInteger(0)
             patch(job.id) { it.copy(phase = "分段并发(" + n + " 路)") }
             val okPipe = runCatching {
                 val chunk = totalLen / n
@@ -3006,9 +3020,26 @@ object HplayDownloads {
                     // 现在：每段**独立重试 4 次**（指数退避 300/600/1200ms），
                     // 只有这一段的 4 次都失败才向上抛（那时确实该退回单连接）。
                     // 续传天然可用：段文件已写多少，下一次就从 `bytes=segFrom+已有-` 接着要。
+                    // ★★★ 第 354 轮（用户报「javchu 下载也是断崖式下降」）：**重试策略按错误类型分档**。
+                    //
+                    // 日志铁证（hplay-log-20261128-010249.txt，1.1.90 实测）：
+                    //   全片 584 个分片，**123 次 SSLHandshakeException**，
+                    //   而且这 123 次**全部集中在下载最后 60 秒**（+2950s..+2990s），
+                    //   同一段重试 6~8 次（`0563.ts` 8 次、`0581.ts` 6 次…）。
+                    //   那一分钟里的吞吐只有 0.17~0.22 MB/s —— 这就是用户看到的「断崖」。
+                    //
+                    // 机理：并发 32 路持续打同一个 CDN，站点侧的握手队列被打满后开始**拒绝新 TLS 连接**
+                    // （`Read error ... Failure in SSL library`）。这时旧的重试（4 次、300/600/1200ms）
+                    // 全落在同一个被拒窗口里 —— 4 次眨眼就烧完，然后这一段就失败了。
+                    //
+                    // 现在分两类：
+                    //   · SSL/握手类：**长退避**（1.5s/3s/6s/12s，共 5 次）—— 握手被拒是「等一下就好」，
+                    //     必须给 CDN 让出恢复时间；
+                    //   · 其余（断流/超时/非 206）：短退避 300/600/1200/2400ms，共 5 次。
+                    // 两类都从 4 次提到 5 次。
                     var segTry = 0
                     var segErr: Throwable? = null
-                    while (segTry < 4) {
+                    while (segTry < 5) {
                         segTry++
                         if (isCancelled(job.id)) throw Cancelled()
                         val have2 = if (pf.exists()) pf.length() else 0L
@@ -3056,9 +3087,15 @@ object HplayDownloads {
                                         (t.message ?: t.javaClass.simpleName) + "），退避后续传",
                                 )
                             }
-                            if (segTry < 4) {
-                                // 300 / 600 / 1200ms；被取消时 sleep 会抛 InterruptedException，走上面的 Cancelled
-                                Thread.sleep(300L shl (segTry - 1))
+                            if (segTry < 5) {
+                                // 第 354 轮：**握手类走长退避**（1.5s 起翻倍），其余仍是 300ms 起翻倍。
+                                // 判据用异常类型而不是字符串匹配：SSLException 家族（含 SSLHandshakeException）
+                                // 就是「TLS 层没握上」，与「数据传一半断了」是两回事。
+                                val sslTrouble = t is javax.net.ssl.SSLException ||
+                                    (t.cause is javax.net.ssl.SSLException)
+                                if (sslTrouble) sslFails.incrementAndGet()
+                                val base = if (sslTrouble) 1500L else 300L
+                                Thread.sleep(base shl (segTry - 1))
                             }
                         }
                     }
@@ -3084,6 +3121,16 @@ object HplayDownloads {
                 if (tmp.length() != totalLen) throw IllegalStateException("合并后长度 " + tmp.length() + " != " + totalLen)
                 // 分段全部成功 -> 记住该域这个段数可用（照 1DM 的 domain_part_limit 思路）
                 runCatching { segLimitByHost[host] = n; segFailByHost.remove(host) }
+                // ★ 第 354 轮：**本次任务内 SSL 握手失败过多 ⇒ 给该域永久降一档**。
+                // 判据：失败次数 > 分片数的 1/4（超过四分之一的段握不上手，不是偶发抖动）。
+                runCatching {
+                    val sf = sslFails.get()
+                    if (sf > 0 && sf > n / 4 && n > 8) {
+                        val down = (n / 2).coerceAtLeast(8)
+                        segLimitByHost[host] = down
+                        com.han1me.lab.LabLog.i("dl", "该域 SSL 握手失败 " + sf + " 次，并发档位 " + n + " → " + down)
+                    }
+                }
                 if (out.exists()) out.delete()
                 if (!tmp.renameTo(out)) throw IllegalStateException("重命名失败")
                 parts.forEach { runCatching { it.delete() } }
@@ -3435,6 +3482,10 @@ object HplayDownloads {
                 msg.contains("unknown host", true) ||
                 msg.contains("No address associated", true)
             val throttled = msg.contains("429")
+            // ★ 第 354 轮：**SSL/握手失败单独一类**。日志实测 123 次 SSLHandshakeException 全挤在
+            // 最后 60 秒（CDN 握手队列被打满），旧策略给的退避太短，全落在同一个被拒窗口里。
+            val sslTrouble = lastErr is javax.net.ssl.SSLException ||
+                lastErr?.cause is javax.net.ssl.SSLException
             // 第 58 轮：把"这个域被限流过"记下来，随后一小段时间对该域降速（而不是全局降并发）。
             if (throttled) runCatching {
                 java.net.URI(url).host?.let { throttledUntil[it] = System.currentTimeMillis() + 30_000L }
@@ -3444,6 +3495,8 @@ object HplayDownloads {
             if (tryIndex >= maxTries + extraTries) break   // 416 梯子有额外预算（extraTries）
             if (tryIndex > 0) {
                 val wait = when {
+                    // 握手被拒要「等」，不是「快点再试」——给 CDN 让出恢复时间
+                    sslTrouble -> 1500L * tryIndex
                     throttled -> 1200L * tryIndex
                     connectFail -> 500L * tryIndex
                     else -> 300L * tryIndex
@@ -3453,6 +3506,7 @@ object HplayDownloads {
                     it.copy(
                         retries = it.retries + 1,
                         phase = when {
+                            sslTrouble -> "TLS 握手被拒，等待 " + (wait / 1000.0) + "s 后重试"
                             throttled -> "被限流，等待 " + (wait / 1000.0) + "s 后重试"
                             connectFail -> "网络未就绪，重连中（第 " + (tryIndex + 1) + " 次）"
                             else -> "重试中"
