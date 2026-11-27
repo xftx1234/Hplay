@@ -79,8 +79,29 @@ class CloudflareInterceptor(
         // 现在加冷却：拿到 clearance 后 [QUIET_MS] 内不再尝试，直接返 403 给上层
         // （上层本来就按「取不到就显示占位」处理，比如头像退回 emoji）。
         val host = request.url.host.lowercase()
+        // ★★★ 第 347 轮修（关注 403 的关键一环）：**冷却期也要先重放一次**。
+        //
+        // 原来的写法是「冷却中 -> 直接返回 403」，**连重放都不做**。
+        // 而两个参考源码的正确模型是：
+        //     if (403 && cf-mitigated == challenge) { … 过盾 … ; return chain.proceed(request) }
+        // 也就是**任何一次被挑战都必须重放**，clearance 只要有效，重放就该过。
+        //
+        // 冷却期的本意只是「别再起 WebView 白等」（cf_clearance 绑 TLS 指纹那套顾虑），
+        // 但它顺手把重放也一起跳过了 —— 于是 clearance 明明有效、GET 全是 200 的情况下，
+        // 唯独 POST 一律 403。这正是用户看到的现象。
+        //
+        // 现在的语义：
+        //   冷却中 = **只跳过「起 WebView 过盾」这一步，仍然重放一次**；
+        //   重放成功就正常返回，失败才把 403 交回上层。
         if (HplayCfHolder.inCooldown(host)) {
-            LabLog.i("cf", "冷却中（" + host + "），跳过质询直接返回 403")
+            runCatching { HplayCfHolder.clearPool() }
+            val retry = runCatching { chain.proceed(CfCookieBridge.applyTo(request)) }.getOrNull()
+            if (retry != null && !isChallenge(retry)) {
+                LabLog.i("cf", "冷却中但重放成功（" + host + "）")
+                return retry
+            }
+            runCatching { retry?.close() }
+            LabLog.i("cf", "冷却中且重放仍被挑战，直接返回 403：" + host)
             return runCatching { chain.proceed(CfCookieBridge.applyTo(request)) }.getOrElse {
                 throw java.io.IOException("Cloudflare 403（冷却中）：" + url)
             }

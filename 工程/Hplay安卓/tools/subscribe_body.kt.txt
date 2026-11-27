@@ -1,0 +1,88 @@
+fun subscribeArtist(userId: String, artistId: String, subscribe: Boolean): Boolean {
+    require(userId.isNotBlank() && artistId.isNotBlank()) { "缺少关注所需的 id" }
+    // ★★★ 第 347 轮：**subscribeVariants 多形态重试**（依据两个参考源码的实证差异）。
+    //
+    // 参考源码事实（逐行读过）：
+    //  · Viewer 的 CloudflareInterceptor：403+cf-mitigated:challenge 时起 CloudflareActivity
+    //    让用户过盾，latch.await() **阻塞等待**，然后 chain.proceed(request) **原样重放**。
+    //    它根本不判 TLS 指纹。
+    //  · Viewer 的 HanimeSubscriptionService：POST subscribe，字段 _token + 三件套，
+    //    请求头**只有 X-CSRF-TOKEN**（无 Origin、无 X-Requested-With）。
+    //  · Plus 的 _submitForm：带 X-CSRF-TOKEN / Referer / Origin / Accept / X-Requested-With，
+    //    419 时刷新令牌重试一次。
+    //
+    // 两家都成功，但头部集合**不同** —— 说明站点不要求某个特定组合，
+    // 而是「过盾之后，浏览器常见形态都能过」。上一轮只试一种就断言「TLS 指纹判定」，
+    // 是判断错误。本轮按从「最像浏览器」到「最像 SDK」的顺序依次重试。
+    //
+    // 语义照两个参考源码：已关注发空串、未关注发 "1"（目标状态）。
+    val status = if (subscribe) "" else "1"
+    val referer = lastWatchUrl.ifBlank { "$BASE/" }
+    var lastCode = -1
+    var lastErr = ""
+    for (variant in 0..3) {
+        // 换形态前刷一次令牌（419 的处置照 Han1mePlus：fresh token 再发）
+        if (variant > 0) runCatching { csrfTokenCache = "" to 0L }
+        val token = runCatching { csrfToken() }.getOrElse { e ->
+            lastErr = e.message.orEmpty()
+            continue
+        }
+        val form = okhttp3.FormBody.Builder()
+            .add("_token", token)
+            .add("subscribe-user-id", userId)
+            .add("subscribe-artist-id", artistId)
+            .add("subscribe-status", status)
+            .build()
+        val b = okhttp3.Request.Builder()
+            .url("$BASE/subscribe")
+            .header("Referer", referer)
+            .header("Origin", BASE)
+            .header("X-CSRF-TOKEN", token)
+            .header("Accept-Language", "zh-TW,zh;q=0.9,en;q=0.8")
+        when (variant) {
+            // ① 文档导航形态：等同于用户点页面上的「关注」按钮
+            0 -> b.header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            )
+            // ② Han1mePlus 原样：带 X-Requested-With
+            1 -> b.header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+            ).header("X-Requested-With", "XMLHttpRequest")
+            // ③ Han1meViewer 原样：最精简，只有 X-CSRF-TOKEN
+            2 -> b.header("Accept", "*/*")
+            // ④ 桌面 UA + XHR（主线版实证可用）
+            3 -> b.header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+            ).header("User-Agent", com.han1me.lab.CfUa.DESKTOP_USER_AGENT)
+                .header("X-Requested-With", "XMLHttpRequest")
+        }
+        val pair = runCatching {
+            http.newCall(b.post(form).build()).execute().use { r ->
+                r.code to (runCatching { r.body?.string().orEmpty() }.getOrDefault(""))
+            }
+        }.getOrElse { e ->
+            lastErr = e.message.orEmpty()
+            continue
+        }
+        lastCode = pair.first
+        if (lastCode in 200..399) {
+            // 回包可能是 JSON/HTML 片段，认得出就按它，认不出就按意图（与参考实现一致）
+            val marked = Regex(
+                """"?(?:subscribed|is_subscribed|subscribe_status)"?\s*[:=]\s*"?([01])""",
+                RegexOption.IGNORE_CASE,
+            ).find(pair.second)?.groupValues?.get(1)
+            return when (marked) {
+                "1" -> true
+                "0" -> false
+                else -> subscribe
+            }
+        }
+        com.han1me.log.AppLog.w("SUB", "variant " + variant + " -> HTTP " + lastCode)
+    }
+    throw IllegalStateException(
+        if (lastCode > 0) "HTTP $lastCode" else lastErr.ifBlank { "关注失败" }
+    )
+}

@@ -2132,33 +2132,24 @@ def patch_last_watch_url(text):
     return NL.join(lines)
 
 
+# 关注/取关的新函数体：Kotlin 源码原样存在外部文件里。
+# 为什么不内联：函数体里含 Kotlin 的 """ 原始字符串（回包正则），
+# 写进 Python 三引号会被提前截断 —— 这是本工程反复踩的转义坑，改用外部文件一劳永逸。
+SUBSCRIBE_BODY_FILE = ROOT / "tools" / "subscribe_body.kt.txt"
+
 def patch_subscribe_origin(text):
-    """关注/取关请求头补齐（第 344 轮 · 用户报「关注按钮报错 HTTP 403」；第 345 轮重做）。
+    """关注/取关：多形态重试（第 347 轮，依据两个参考源码的实证差异）。
 
-    ## 第 345 轮：上一版为什么没生效
-
-    上一版的守卫写的是
-        if '.header("Origin", BASE)' in text: return text
-    想表达「已经补过就跳过」。但 postForm（第 1786 行）**本来就带**这一行 ——
-    substring 命中立刻早退，于是 subscribeArtist 那一段从头到尾没被改过。
-    真机日志核对：gen/HanimeClient.kt 里 `Origin` 只出现 2 次（1699 / 1786），
-    都在 postForm 与收藏链路，subscribeArtist 里一次都没有。
-
-    守卫改成**只检查 subscribeArtist 自己那一段**。
-
-    ## 403 的三层原因（对照两份参考源码逐条核）
-
-    · Han1meViewer `HanimeSubscriptionService`：@POST("subscribe") + @Field("_token")
-      + @Field 三件套 + @Header("X-CSRF-TOKEN")；Retrofit 会同源发请求，
-      不额外带 Origin —— 它靠的是**同一个 OkHttpClient + CookieJar**。
-    · Han1mePlus `han1me_api._submitForm`：显式带
-      X-CSRF-TOKEN / Referer / **Origin** / Accept / X-Requested-With，
-      并且**419 会刷新 token 重试一次**。
-    我们照 Plus 的写法更稳（Laravel 的 VerifyCsrfToken 比对 Origin/Referer 与 Host）。
-
-    第三层是**令牌来源**：Laravel 会话里 _token 与登录 cookie 必须配对。
-    每次现抓首页虽然能用，但拿到的是「那一刻」的 token；
-    缓存 60 秒 + 失败重取一次，既少一发请求，也避免极端时序下拿旧 token。
+    参考源码事实（逐行读过）：
+    · Viewer CloudflareInterceptor：403+challenge 时起 CloudflareActivity 过盾，
+      latch.await() 阻塞等待，然后 chain.proceed(request) **原样重放**。
+      它不判 TLS 指纹，只做「过一次盾 + 重放」。
+    · Viewer HanimeSubscriptionService：POST subscribe，字段 _token+三件套，
+      头只有 X-CSRF-TOKEN（无 Origin、无 X-Requested-With）。
+    · Plus _submitForm：带 X-CSRF-TOKEN/Referer/Origin/Accept/X-Requested-With，
+      419 时刷新令牌重试。
+    两家都成功但头部集合不同 -> 站点不要求特定组合，过盾后常见浏览器形态都能过。
+    上一轮只试一种就下结论，是判断错误。本轮按 4 种形态依次重试。
     """
     anchor = "fun subscribeArtist(userId: String, artistId: String, subscribe: Boolean): Boolean {"
     i = text.find(anchor)
@@ -2167,122 +2158,10 @@ def patch_subscribe_origin(text):
     j = text.find("fun toggleFavorite(", i)
     if j < 0:
         return text
-    block = text[i:j]
-    if '.header("Origin", BASE)' in block:
+    if "subscribeVariants" in text[i:j]:
         return text
-    old = NL.join([
-        '            .header("Referer", "$BASE/")',
-        '            .header("X-CSRF-TOKEN", token)',
-        '            .header("X-Requested-With", "XMLHttpRequest")',
-    ])
-    new = NL.join([
-        '            // ' + chr(0x2605)*3 + ' 第 345 轮（用户复报「关注按钮仍然 HTTP 403」）：补齐同源头。',
-        '            // Laravel 的 VerifyCsrfToken 会比对 Origin/Referer 与 Host；',
-        '            // 只给 Referer 时，经代理/镜像链路会被直接判 403（实测如此）。',
-        '            // 参考 Han1mePlus 的 _submitForm：Origin / Accept / X-Requested-With 一起给。',
-        '            // ' + chr(0x2605) + ' Referer 用详情页而不是首页：原生表单提交的 Referer 就是那个页面，',
-        '            // 而 CF 的这条规则也会看 Referer 与提交路径的一致性。',
-        '            .header("Referer", com.javrocket.hanime.HanimeClient.lastWatchUrl.ifBlank { "$BASE/" })',
-        '            .header("Origin", BASE)',
-        '            // ★ 第 345 轮：**UA 用桌面形态**（主线版实证可过）。',
-        '            // 实验版全局 UA 是 Android 移动版（CfUa.USER_AGENT），与 WebView 过盾保持一致；',
-        '            // 但 CF 对移动 UA 的 POST 似乎更敏感。主线版用桌面 Chrome UA，关注一直是好的。',
-        '            .header("User-Agent", com.han1me.lab.CfUa.DESKTOP_USER_AGENT)',
-        '            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")',
-        '            .header("Accept-Language", "zh-TW,zh;q=0.9,en;q=0.8")',
-        '            .header("X-CSRF-TOKEN", token)',
-        '            // ' + chr(0x2605) * 3 + ' 第 345 轮第二轮（真机 403 的最后一块拼图）：**不能带 X-Requested-With**。',
-        '            //',
-        '            // 真机日志：GET / -> 200、POST /subscribe -> 403 Cf-Mitigated=challenge。',
-        '            // 同一条客户端、同一份 Cookie、相隔 489ms。所以问题不在 Cookie 也不在令牌，',
-        '            // 而在「这条 POST 被 CF 当成什么」。',
-        '            //',
-        '            // 对照两个参考源码：',
-        '            //   · Han1meViewer HanimeSubscriptionService —— 只有 @Header("X-CSRF-TOKEN")，',
-        '            //     **没有 X-Requested-With**；',
-        '            //   · Han1mePlus _submitForm —— 带 X-Requested-With，但它的请求跑在',
-        '            //     WebView 已过盾的环境里（同一进程有 cf_clearance + 真浏览器指纹）。',
-        '            // 我们两样都没有，却把 XHR 的标记带上了 —— CF 的 WAF 规则正是',
-        '            // 「POST + X-Requested-With + /subscribe」这条组合。',
-        '            //',
-        '            // 真实用户点页面上的「关注」是一次**原生表单提交**（顶层文档导航），',
-        '            // 浏览器不会给它加 X-Requested-With，Accept 也是文档型。',
-        '            // 这里照那个形态发：去掉 XHR 头、Accept 用文档型、Referer 精确到详情页。',
-        '            // ' + chr(0x2605) + ' 不能带 X-Requested-With —— 它是把请求标记成 XHR 的唯一头部。',
-    ])
-    if old not in block:
-        return text
-    block2 = block.replace(old, new, 1)
-    # 补 419 重试：token 过期时刷新一次再发（Han1mePlus 同款处理）
-    old2 = NL.join([
-        '        return http.newCall(req).execute().use { resp ->',
-        '            val text = runCatching { resp.body?.string().orEmpty() }.getOrDefault("")',
-        '            if (!resp.isSuccessful) throw IllegalStateException("HTTP $" + "{resp.code}")',
-    ])
-    new2 = NL.join([
-        '        var call = http.newCall(req).execute().use { it.code to (runCatching { it.body?.string().orEmpty() }.getOrDefault("")) }',
-        '        // ' + chr(0x2605)*3 + ' 第 345 轮：419 = Laravel「CSRF 令牌已过期」。',
-        '        // 令牌是现抓首页拿的，理论上不会过期；但镜像/代理会改写会话，',
-        '        // 所以照 Han1mePlus 的做法：419 时丢弃缓存 token、重取一次再发。',
-        '        if (call.first == 419) {',
-        '            csrfTokenCache = "" to 0L',
-        '            val t2 = csrfToken()',
-        '            val b2 = okhttp3.FormBody.Builder()',
-        '                .add("_token", t2)',
-        '                .add("subscribe-user-id", userId)',
-        '                .add("subscribe-artist-id", artistId)',
-        '                .add("subscribe-status", status)',
-        '                .build()',
-        '            val r2 = req.newBuilder()',
-        '                .header("X-CSRF-TOKEN", t2)',
-        '                .post(b2)',
-        '                .build()',
-        '            call = http.newCall(r2).execute().use { it.code to (runCatching { it.body?.string().orEmpty() }.getOrDefault("")) }',
-        '        }',
-        '        val code = call.first',
-        '        val text = call.second',
-        '        if (code !in 200..299) throw IllegalStateException("HTTP $" + "{code}")',
-    ])
-    if old2 in block2:
-        block2 = block2.replace(old2, new2, 1)
-    return text[:i] + block2 + text[j:]
-
-
-def patch_subscribe_webview(text):
-    """关注按钮改走 HplaySubscribe（第 345 轮）。
-
-    真机日志（11:27:22 同一时刻的两条）：
-        GET  hanime1.me/          -> 200  Server=cloudflare
-        POST hanime1.me/subscribe -> 403  Cf-Mitigated=challenge
-
-    同一条客户端、同一份 Cookie，GET 通、POST 被挑战 —— 这不是 CSRF（那会是 419，
-    或 403 但不带 cf-mitigated），是 Cloudflare 的 WAF 对 POST /subscribe
-    单独下发 managed challenge。挑战按 TLS 指纹（JA3）判定，OkHttp 用 Conscrypt，
-    指纹与 Chromium 不同，Cookie 带得再全也过不了。
-
-    这里只把 UI 的调用点换成 HplaySubscribe.toggle —— 它内部先走 OkHttp，
-    403 时自动回落到 WebView 同源 fetch（见 src/com/han1me/lab/HplaySubscribe.kt）。
-    跟 HplayOrientationHost 那种「网络层不碰 UI」的分层保持一致。
-    """
-    old = "                                                val now = HanimeClient.subscribeArtist("
-    if old not in text:
-        return text
-    # ★ 第 345 轮后续：**回落已移除**。HplaySubscribe 里的 WebView 通道
-    # 在真机上反复验证都卡在 Cloudflare 挑战页（页面标题 "Just a moment..."），
-    # 即使按 HplayGateActivity 启用了 CfUa.USER_AGENT + ProxyController
-    # + 第三方 cookie + ALWAYS_ALLOW 四项，仍不通。
-    # 空等 30 秒后报一个更难看的错，不如直接把 OkHttp 的 403 如实报出来。
-    # WebView 通道代码保留在 HplaySubscribe.submitInPage，供后续定位。
-    new = "                                                val now = HanimeClient.subscribeArtist("
-    text = text.replace(old, new, 1)
-    # toggle 的第一个参数是详情页地址：WebView 回落要打开它才能拿到站方表单
-    old2 = "                                                val now = com.han1me.lab.HplaySubscribe.toggle("
-    _i2 = text.find(old2)
-    if _i2 >= 0:
-        _j2 = text.find(chr(10), _i2)
-        if _j2 > 0:
-            text = text[:_j2] + chr(10) + "                                                    d.video.url," + text[_j2:]
-    return text
+    body = SUBSCRIBE_BODY_FILE.read_text(encoding="utf-8")
+    return text[:i] + body + text[j:]
 
 
 def patch_csrf_cache(text):
@@ -2338,6 +2217,35 @@ def patch_csrf_cache(text):
 
     ])
     return text.replace(old, new, 1)
+
+
+def patch_subscribe_webview(text):
+    """关注按钮：403 时走 WebView 真实导航提交（第 347 轮）。
+
+    真机证据（本轮）：
+      · clearance 已记录、GET 全 200；
+      · POST /subscribe 四种头部形态**全部** 403 + Cf-Mitigated=challenge；
+      · CloudflareInterceptor 已经重放过一次，重放仍被挑战。
+    结论：cf_clearance 对「非导航的 POST」不生效 —— CF 的 WAF 规则只放行页面内的导航请求。
+
+    两个参考源码能关注，不是因为请求头写得好，而是因为它们都在**真实 WebView 里**
+    让页面自己提交（Viewer 的 CloudflareActivity 过盾后由 WebView 承载后续导航）。
+    所以这里把 HplaySubscribe.toggle 接回调用点：它先走 OkHttp（快），
+    403 时起不可见 WebView 打开详情页、改表单值后 form.submit()。
+    """
+    old = "                                                val now = HanimeClient.subscribeArtist("
+    if old not in text:
+        return text
+    new = "                                                val now = com.han1me.lab.HplaySubscribe.toggle("
+    text = text.replace(old, new, 1)
+    # 第一个参数是详情页地址（WebView 要打开它才能拿到站方自己的表单）
+    anchor2 = new
+    k = text.find(anchor2)
+    if k >= 0:
+        e = text.find(chr(10), k)
+        if e > 0:
+            text = text[:e] + chr(10) + "                                                    d.video.url," + text[e:]
+    return text
 
 
 def patch_update_panel_wire(text):
@@ -2834,9 +2742,11 @@ def apply_rules(text, out_name, strict=True):
     if out_name == "HanimeClient.kt":
         text = patch_artist_avatar(text)
         text = patch_title_unescape(text)
-        text = patch_subscribe_origin(text)
-        text = patch_last_watch_url(text)
+        # ★ 顺序要紧：csrf 缓存必须**先**建好，
+        # 因为新的 subscribeArtist 要清它（换形态前刷令牌）。
         text = patch_csrf_cache(text)
+        text = patch_last_watch_url(text)
+        text = patch_subscribe_origin(text)
     if out_name == "X99.kt":
         text = patch_age_gate(text)
         text = patch_board_search_fix(text)
@@ -2858,6 +2768,7 @@ def apply_rules(text, out_name, strict=True):
         text = patch_board_pickall(text)
         text = patch_board_pickone(text)
     if out_name == "Han1meApp.kt":
+        text = patch_subscribe_webview(text)
         text = patch_update_panel_wire(text)
         text = patch_drop_showupdate_state(text)
         text = patch_dedup_downloads_panel(text)
