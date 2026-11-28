@@ -22,7 +22,28 @@ import android.app.Activity
  */
 object CurrentActivity {
 
-    fun find(): Activity? = runCatching {
+    /**
+     * ★ 第 355 轮：**反射结果做 5 秒缓存**。
+     *
+     * 调用方（AvatarFetcher / 过盾流程）可能在一屏里连调十几次，
+     * 而每次都 `Class.forName + getDeclaredMethod + 遍历 mActivities`
+     * —— 反射在这条路径上是要走 ART 方法查找的，几十次叠起来就是可见的卡顿。
+     * 缓存只存 5 秒：Activity 切换（返回、跳页）在 5 秒内必然已经反映到新值。
+     */
+    @Volatile private var cachedAt: Long = 0L
+    @Volatile private var cachedActivity: Activity? = null
+
+    fun find(): Activity? {
+        val now = System.currentTimeMillis()
+        val c = cachedActivity
+        if (c != null && !c.isFinishing && !c.isDestroyed && now - cachedAt < 5_000L) return c
+        val a = findUncached()
+        cachedActivity = a
+        cachedAt = now
+        return a
+    }
+
+    private fun findUncached(): Activity? = runCatching {
         val cls = Class.forName("android.app.ActivityThread")
         val m = cls.getDeclaredMethod("currentActivityThread").apply { isAccessible = true }
         val thread = m.invoke(null) ?: return null

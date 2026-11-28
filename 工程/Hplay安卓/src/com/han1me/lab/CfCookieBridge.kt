@@ -4,74 +4,96 @@ import android.content.Context
 import android.content.SharedPreferences
 
 /**
- * **cookie 总汇**（2026-11-25 第 322 轮重写）。
+ * **cookie 总汇（第 355 轮 · 按域模型重写，对齐 Han1meViewer 的 HCookieJar）**。
  *
- * ## 用户要求
-
- * 「让 cf 过一次全部都不用重新验证」「如果修不好就丢弃云端头像」。
+ * ## 为什么这一轮要重写
  *
- * ## 两个参考项目是怎么做到的
+ * 用户实测：「关注功能会随内置节点网络变化而出现无法关注问题……让 cookie 可实现包含
+ * 全部云端账户请求，或者在最初 cf 验证时就一次解决所有带 cf 验证的相关问题」。
+ *
+ * 上一版（第 322 轮）把 cookie 当成**一个域**的东西：三串 key 全部硬编码给
+ * `hanime1.me`，`parsed()` 甚至不接收 url。后果：
+ *
+ *  · `javchu.com` 也是 Cloudflare 前置，但它的 clearance **根本无处存放** ——
+ *    换节点后 javchu 页面 403，我们连"重放一次"的凭据都没有；
+ *  · 用户过盾时只抓了 `hanime1.me` 一个域的 cookie，其它 CF 域等于没过盾；
+ *  · `parsed()` 把 hanime1 的 `hanime1_session` 发给了所有域（越权且会被 CF 判异常）。
+ *
+ * ## 参考实现（逐行读过的结论）
  *
  * | 项目 | 做法 |
  * |---|---|
- * | Han1meViewer | `HCookieJar.loadForRequest` **每次请求**都把 `Preferences.loginCookie` 与 `Preferences.cloudFlareCookie` 合并进来。cookie 是"一直带着"的，不是"导入一次"。 |
- * | Han1mePlus | `saveCookies` 存整串到 account_store，`setCloudflareCookie` 灌进 Dio 的 CookieManager，且**每次启动**都回灌。 |
+ * | Han1meViewer · `HCookieJar.loadForRequest(url)` | **每次请求**按 `url.host` 取 login + cloudflare 两串，合并后交给 OkHttp |
+ * | Han1meViewer · `CloudflareActivity` | 过盾后 `cookieMgr.getCookie(url)` 取**当前域**整串 → `Preferences.cloudFlareCookie = CookieString(cookies)` |
+ * | Han1mePlus · `WebViewCookieBridge.read(urls)` | 把 `hanime1.me / hanime1.com / hanimeone.me / javchu.com` **四个域**的 cookie 一起读出来合并 |
+ * | Han1mePlus · `AccountStore` | 按 `host` 分键存 `cloudflare_cookie_v2:<host>` |
  *
- * 共同点：**cookie 必须是"每次请求都合并"的模型**，而不是"过盾时往 map 里塞一次"。
+ * 三者共同点：**cookie 是按域存的，且每次请求都按域合并**。
+ * 本类就是这两条的 Kotlin 实现。
  *
- * ## 旧实现错在哪
- *
- * `importIntoClient` 把 cookie 塞进 `HanimeClient.cookieMap`，而那个 jar 有两条硬编码：
- *
- * ```kotlin
- * // 1) 导入时丢弃所有以 _ 开头的 cookie
- * if (k.isEmpty() || k.startsWith("_")) continue
- * // 2) 发请求时也丢弃所有以 _ 开头的
- * cookieMap.filterKeys { !it.startsWith("_") }...
- * ```
- *
- * 第一条是为了不把内部标记 `_uid` 当成 cookie 发出去 ——
- * 但它**连 `__cf_bm`、`_cfuvid` 一起丢了**，而这两个是 Cloudflare 的
- * bot-management cookie，缺了它们 clearance 会被判为"环境不一致"。
- *
- * 更关键的是 **cookie 的域/路径全是硬编码**（`domain("hanime1.me").path("/")`），
- * WebView 里那些带 `Path=/user` 的会话 cookie 语义就被抹平了。
- *
- * ## 现在的模型（三层，全部落盘）
+ * ## 存储模型（全部落盘）
  *
  * ```
- *  cf.cookie.raw      ← WebView 过盾后 CookieManager 的整串（含 cf_clearance / __cf_bm）
- *  login.cookie.raw   ← 登录成功后 CookieManager 的整串（含 hanime1_session / remember_web）
- *  extra.cookie.raw   ← OkHttp 响应里新下发的 Set-Cookie（服务端刷新 clearance 时更新）
+ *  cf.cookie.raw@<host>     ← 该域过盾后 CookieManager 的整串（含 cf_clearance / __cf_bm）
+ *  login.cookie.raw@<host>  ← 该域登录后的整串（含 hanime1_session / remember_web）
+ *  extra.cookie.raw@<host>  ← OkHttp 响应里新下发的 Set-Cookie（服务端续期）
  * ```
  *
- * 三者由 [allCookieHeader] **按 name 合并去重**（后写的胜），交给
- * [HplayCookieInterceptor] 在**每次请求**前补进 Cookie 头 —— 与 Viewer 的
- * `loadForRequest` 完全等价，但不用改上游 `HanimeClient`。
+ * 兼容：`hanime1.me` 读不到分域键时回落到**旧的无域键**（`cf.cookie.raw` 等），
+ * 老用户升级后登录态不丢。
  */
 object CfCookieBridge {
 
     private const val SP = "hplay_cf"
 
-    /** WebView 过盾后拿到的整串（含 cf_clearance）。 */
-    private const val K_CF_COOKIE = "cf.cookie.raw"
+    /** 需要管理 cookie 的 Cloudflare 前置域（照 Han1mePlus 的 WebViewCookieBridge.urls）。 */
+    val HOSTS: List<String> = listOf(
+        "hanime1.me",
+        "hanime1.com",
+        "hanimeone.me",
+        "javchu.com",
+    )
 
-    /** 登录成功后的整串。 */
-    private const val K_LOGIN_COOKIE = "login.cookie.raw"
+    /** 默认域（旧接口的隐含目标）。 */
+    private const val DEFAULT_HOST = "hanime1.me"
 
-    /** 网络响应里新下发/刷新的 cookie。 */
-    private const val K_EXTRA_COOKIE = "extra.cookie.raw"
+    private const val K_CF = "cf.cookie.raw"
+    private const val K_LOGIN = "login.cookie.raw"
+    private const val K_EXTRA = "extra.cookie.raw"
 
     private fun prefs(): SharedPreferences =
         com.han1me.HplayEnv.requireContext()
             .getSharedPreferences(SP, Context.MODE_PRIVATE)
 
-    private fun read(k: String): String =
-        runCatching { prefs().getString(k, "").orEmpty() }.getOrDefault("")
+    /** 从 URL 里取 host（大小写归一）；取不到就用默认域。 */
+    fun hostOf(url: String): String {
+        val h = runCatching { java.net.URI(url).host.orEmpty() }.getOrDefault("")
+        return normalize(h)
+    }
 
-    private fun write(k: String, v: String) {
+    /** 把 `www.` 之类去掉并小写，落到 [HOSTS] 里的某个域。 */
+    private fun normalize(raw: String): String {
+        var h = raw.trim().lowercase()
+        if (h.startsWith("www.")) h = h.substring(4)
+        if (h.isBlank()) return DEFAULT_HOST
+        for (d in HOSTS) if (h == d || h.endsWith("." + d)) return d
+        return h
+    }
+
+    private fun key(k: String, host: String): String = "$k@$host"
+
+    private fun read(k: String, host: String): String {
+        val p = runCatching { prefs() }.getOrNull() ?: return ""
+        val scoped = runCatching { p.getString(key(k, host), "") }.getOrDefault("").orEmpty()
+        if (scoped.isNotBlank()) return scoped
+        // 兼容旧的无域键（只有默认域继承，避免把 hanime1 的会话发给别的站）
+        if (host != DEFAULT_HOST) return ""
+        return runCatching { p.getString(k, "") }.getOrDefault("").orEmpty()
+    }
+
+    private fun write(k: String, host: String, v: String) {
         runCatching {
-            prefs().edit().putString(k, v).apply()
+            prefs().edit().putString(key(k, host), v).apply()
         }.onFailure { LabLog.i("cf", "cookie 落盘失败 " + it.javaClass.simpleName) }
     }
 
@@ -79,104 +101,112 @@ object CfCookieBridge {
     // 写
     // ================================================================
 
-    /** 保存 WebView 过盾拿到的整串（含 cf_clearance）。 */
-    fun persist(rawCookies: String) {
+    /** 保存某个域过盾拿到的整串（含 cf_clearance）。 */
+    fun persistFor(host: String, rawCookies: String) {
         if (rawCookies.isBlank()) return
+        val h = normalize(host)
         // 与旧值合并：新串可能只有 clearance 而没有 session，不能把 session 冲掉
-        val merged = mergeCookie(read(K_CF_COOKIE), rawCookies)
-        write(K_CF_COOKIE, merged)
+        val merged = mergeCookie(read(K_CF, h), rawCookies)
+        write(K_CF, h, merged)
         bumpVersion()
-        LabLog.i("cf", "clearance 已落盘 " + merged.length + " 字节")
+        LabLog.i("cf", "clearance 已落盘 " + h + " " + merged.length + " 字节")
     }
 
-    /** 保存登录 cookie。 */
-    fun persistLogin(rawCookies: String) {
+    /** 保存默认域（hanime1.me）的 clearance —— 旧签名，保留给既有调用点。 */
+    fun persist(rawCookies: String) = persistFor(DEFAULT_HOST, rawCookies)
+
+    /** 保存某个域的登录 cookie。 */
+    fun persistLoginFor(host: String, rawCookies: String) {
         if (rawCookies.isBlank()) return
-        val merged = mergeCookie(read(K_LOGIN_COOKIE), rawCookies)
-        write(K_LOGIN_COOKIE, merged)
+        val h = normalize(host)
+        val merged = mergeCookie(read(K_LOGIN, h), rawCookies)
+        write(K_LOGIN, h, merged)
         bumpVersion()
-        LabLog.i("login", "登录态已落盘 " + merged.length + " 字节")
+        LabLog.i("login", "登录态已落盘 " + h + " " + merged.length + " 字节")
     }
+
+    fun persistLogin(rawCookies: String) = persistLoginFor(DEFAULT_HOST, rawCookies)
 
     /**
-     * 收集响应里的 `Set-Cookie` 并落盘。
+     * 收集某个域响应里的 `Set-Cookie` 并落盘。
      *
-     * 为什么要做：CF 会在每次校验通过后**刷新** `cf_clearance` 的有效期
-     * （响应头里带新的 Set-Cookie）。旧实现只在过盾那一刻存一次，
-     * 于是 clearance 到期后必然要重新弹窗 —— 用户看到的就是「隔几小时又要点一次」。
-     * 现在只要 App 还在用，每次刷新都会被收下，有效期自然续上。
+     * CF 每次校验通过都会**刷新** `cf_clearance` 的到期时间，
+     * 只要 App 还在用，有效期自然续上 —— 除非换节点/换 IP。
      */
-    fun harvest(setCookies: List<String>) {
+    fun harvestFor(host: String, setCookies: List<String>) {
         if (setCookies.isEmpty()) return
+        val h = normalize(host)
         val picked = StringBuilder()
         for (raw in setCookies) {
-            // Set-Cookie: name=value; Path=/; Expires=...; Secure; HttpOnly
             val pair = raw.substringBefore(';').trim()
             val i = pair.indexOf('=')
             if (i <= 0) continue
             val name = pair.substring(0, i).trim()
             val value = pair.substring(i + 1).trim()
             if (name.isEmpty() || value.isEmpty()) continue
-            // 只收本站相关的（其它域的下发与我们无关）
-            if (name.startsWith("cf_chl_")) continue   // 挑战过程用的临时票，留着反而污染
+            if (name.startsWith("cf_chl_")) continue   // 挑战过程用的临时票
             if (picked.isNotEmpty()) picked.append("; ")
             picked.append(name).append('=').append(value)
         }
         if (picked.isEmpty()) return
-        val merged = mergeCookie(read(K_EXTRA_COOKIE), picked.toString())
-        write(K_EXTRA_COOKIE, merged)
+        val merged = mergeCookie(read(K_EXTRA, h), picked.toString())
+        write(K_EXTRA, h, merged)
         bumpVersion()
-        LabLog.i("cf", "收到服务端 cookie 刷新 " + picked.length + " 字节")
+        LabLog.i("cf", "收到服务端 cookie 刷新 " + h + " " + picked.length + " 字节")
     }
+
+    fun harvest(setCookies: List<String>) = harvestFor(DEFAULT_HOST, setCookies)
 
     // ================================================================
     // 读
     // ================================================================
 
-    fun savedLogin(): String = read(K_LOGIN_COOKIE)
+    fun savedLoginFor(host: String): String = read(K_LOGIN, normalize(host))
 
-    fun savedClearance(): String = read(K_CF_COOKIE)
+    fun savedLogin(): String = savedLoginFor(DEFAULT_HOST)
+
+    fun savedClearanceFor(host: String): String = read(K_CF, normalize(host))
+
+    fun savedClearance(): String = savedClearanceFor(DEFAULT_HOST)
+
+    /** 该域是否已有 cf_clearance（决定要不要先静默重放）。 */
+    fun hasPersistedFor(host: String): Boolean {
+        val h = normalize(host)
+        return read(K_CF, h).contains("cf_clearance") ||
+            read(K_EXTRA, h).contains("cf_clearance")
+    }
+
+    fun hasPersisted(): Boolean = hasPersistedFor(DEFAULT_HOST)
 
     /** 是否有任何可用 cookie（决定 CF 拦截器要不要先静默重放）。 */
-    fun hasAnyCookie(): Boolean =
-        read(K_CF_COOKIE).isNotBlank() || read(K_LOGIN_COOKIE).isNotBlank()
-
-    /** 磁盘上是否已有 cf_clearance（重启后仍有效）。 */
-    fun hasPersisted(): Boolean =
-        read(K_CF_COOKIE).contains("cf_clearance") ||
-            read(K_EXTRA_COOKIE).contains("cf_clearance")
+    fun hasAnyCookie(): Boolean = HOSTS.any {
+        read(K_CF, it).isNotBlank() || read(K_LOGIN, it).isNotBlank()
+    }
 
     /**
-     * **合并三层的 Cookie 头**（每次请求都调）。
+     * **按域合并三层 Cookie 头**（每次请求都调）。
      *
      * 顺序即优先级：后写的覆盖先写的。
      * `extra`（服务端最新下发）> `clearance`（过盾时拿到的）> `login`（登录时拿到的）。
-     *
-     * @param url 目标地址（目前只有一个域，保留参数便于将来分域）
      */
     fun allCookieHeader(url: String = "https://hanime1.me/"): String {
-        // 缓存：cookieJar.loadForRequest 是**每条请求**都要调的，
-        // 每次都读三次 SharedPreferences + 解析三次字符串会明显拖慢。
-        // 三个写入点（persist / persistLogin / harvest）都会 bump 版本号。
+        val h = hostOf(url)
         val v = version
-        if (v == cacheVersion && cacheValue != null) return cacheValue!!
+        if (v == cacheVersion && cacheHost == h && cacheValue != null) return cacheValue!!
         var out = ""
-        out = mergeCookie(out, read(K_LOGIN_COOKIE))
-        out = mergeCookie(out, read(K_CF_COOKIE))
-        out = mergeCookie(out, read(K_EXTRA_COOKIE))
+        out = mergeCookie(out, read(K_LOGIN, h))
+        out = mergeCookie(out, read(K_CF, h))
+        out = mergeCookie(out, read(K_EXTRA, h))
         cacheValue = out
         cacheVersion = v
+        cacheHost = h
         return out
     }
 
-    @Volatile
-    private var version: Int = 0
-
-    @Volatile
-    private var cacheVersion: Int = -1
-
-    @Volatile
-    private var cacheValue: String? = null
+    @Volatile private var version: Int = 0
+    @Volatile private var cacheVersion: Int = -1
+    @Volatile private var cacheHost: String = ""
+    @Volatile private var cacheValue: String? = null
 
     private fun bumpVersion() {
         version++
@@ -187,21 +217,9 @@ object CfCookieBridge {
      *
      * ## 为什么必须走 cookieJar，而不是只设 Cookie 头（第 322 轮真机定位）
      *
-     * OkHttp 的 `BridgeInterceptor` 里有这么一段：
-     *
-     * ```kotlin
-     * val cookies = cookieJar.loadForRequest(userRequest.url)
-     * if (cookies.isNotEmpty()) {
-     *     userRequestBuilder.header("Cookie", cookieHeader(cookies))   // ← 直接覆盖
-     * }
-     * ```
-     *
-     * 也就是说：**应用拦截器里设的 Cookie 头，只要 jar 返回非空就会被整条替换掉**。
-     * 这正是 Viewer 把登录/clearance cookie 塞进 `HCookieJar.loadForRequest`
-     * （而不是塞进请求头）的原因 —— 那里是唯一不会被覆盖的地方。
-     *
-     * 日志证据（改之前）：WebView 拿到 3532 字节 cookie、重放仍 403；
-     * 因为重放那一刻 jar 只吐了 cookieMap 里那几个，clearance 根本不在里面。
+     * OkHttp 的 `BridgeInterceptor` 里：只要 jar 返回非空，就会**整条覆盖** Cookie 头。
+     * 这正是 Viewer 把登录/clearance cookie 塞进 `HCookieJar.loadForRequest` 的原因 ——
+     * 那里是唯一不会被覆盖的地方。
      */
     fun parsed(url: String = "https://hanime1.me/"): List<Pair<String, String>> {
         val all = allCookieHeader(url)
@@ -218,21 +236,10 @@ object CfCookieBridge {
     }
 
     /**
-     * **给一条请求挂上完整 Cookie 头**（CF 拦截器重放时必须调）。
+     * **给一条请求挂上该域的完整 Cookie 头**（CF 拦截器重放时必须调）。
      *
-     * ## 为什么重放要单独调（第 322 轮真机定位）
-     *
-     * OkHttp 的拦截器链是单向的：CF 拦截器拿到的 `chain` 位置在
-     * `HplayCookieInterceptor` **之后**。它调 `chain.proceed(request)` 时，
-     * 前面的拦截器（含 cookie 补全）**不会重新执行** ——
-     * 于是重放用的是那条**原始请求**（没有任何 Cookie 头）。
-     *
-     * 真机日志就是这个形态：
-     * ```
-     * [cf] 静默过盾成功，cookie 3532 字节     <- WebView 拿到了
-     * [cf] 静默过盾拿到 cookie 但重放仍被挑战   <- 重放是裸的，当然还是 403
-     * ```
-     *
+     * OkHttp 的拦截器链是单向的：CF 拦截器拿到的 `chain` 在 cookie 拦截器**之后**，
+     * 它调 `chain.proceed(request)` 时前面的拦截器不会重跑 —— 重放用的是裸请求。
      * 所以重放前必须显式把 cookie 挂上去。
      */
     fun applyTo(request: okhttp3.Request): okhttp3.Request {
@@ -246,8 +253,6 @@ object CfCookieBridge {
 
     /**
      * 合并两个 `k=v; k2=v2` 串：右边的值覆盖左边的同名项，顺序保持左边在前。
-     *
-     * 公开给 [HplayCookieInterceptor] 用（请求原有 Cookie 优先，我们只补缺）。
      */
     fun mergeCookie(base: String, extra: String): String {
         if (extra.isBlank()) return base
@@ -279,12 +284,16 @@ object CfCookieBridge {
     /** 清掉登录态（退出登录用）；clearance 保留（它属于本机网络环境，不属于账号）。 */
     fun clearLogin() {
         runCatching {
-            prefs().edit().remove(K_LOGIN_COOKIE).apply()
-            // 退出登录时也清掉服务端下发的会话类 cookie，避免下一个账号继承上一个的身份
-            val extra = read(K_EXTRA_COOKIE)
-            if (extra.contains("hanime1_session") || extra.contains("remember_web")) {
-                prefs().edit().remove(K_EXTRA_COOKIE).apply()
+            val e = prefs().edit()
+            for (h in HOSTS) {
+                e.remove(key(K_LOGIN, h))
+                val extra = read(K_EXTRA, h)
+                if (extra.contains("hanime1_session") || extra.contains("remember_web")) {
+                    e.remove(key(K_EXTRA, h))
+                }
             }
+            e.remove(K_LOGIN)
+            e.apply()
         }
         bumpVersion()
         LabLog.i("login", "已清除登录态")
@@ -293,64 +302,65 @@ object CfCookieBridge {
     /** 彻底清空（调试/重置用）。 */
     fun clearAll() {
         runCatching { prefs().edit().clear().apply() }
+        bumpVersion()
     }
 
     /**
-     * 启动时把三段 cookie 回灌进两处：
-     *  · OkHttp：由 [HplayCookieInterceptor] 每次请求自动带 —— 这里**不用**再灌；
-     *  · CookieManager（WebView）：下次过盾/网页登录时能直接过。
+     * 启动时把**每个域**的三段 cookie 回灌进 CookieManager（WebView）。
      *
-     * 旧实现还要 importIntoClient（往上游 cookieMap 塞），现在废弃了 ——
-     * 那条路会丢掉 `_` 开头的 cookie，正是 clearance 失效的元凶之一。
+     * 这与参考实现一致：cookie 不是"用一次就完"，而是每次启动都回灌，
+     * 这样下次过盾/网页登录时能直接过。
      */
     fun restoreAtStartup() {
-        val all = allCookieHeader()
-        if (all.isBlank()) {
-            LabLog.i("cf", "无历史 cookie，首次需过一次挑战")
-            return
-        }
+        var total = 0
         runCatching {
             val cm = android.webkit.CookieManager.getInstance()
             cm.setAcceptCookie(true)
-            for (seg in all.split(';')) {
-                val s = seg.trim()
-                if (s.isEmpty()) continue
-                cm.setCookie("https://hanime1.me/", s)
-                cm.setCookie("https://.hanime1.me/", s)
+            for (h in HOSTS) {
+                val all = allCookieHeader("https://$h/")
+                if (all.isBlank()) continue
+                total += all.length
+                for (seg in all.split(';')) {
+                    val s = seg.trim()
+                    if (s.isEmpty() || !s.contains('=')) continue
+                    cm.setCookie("https://$h/", s)
+                    cm.setCookie("https://.$h/", s)
+                }
             }
             cm.flush()
         }.onFailure {
             LabLog.i("cf", "回灌 CookieManager 失败 " + it.javaClass.simpleName)
         }
-        LabLog.i("cf", "已回灌历史 cookie " + all.length + " 字节（clearance=" + hasPersisted() + "）")
+        if (total == 0) LabLog.i("cf", "无历史 cookie，首次需过一次挑战")
+        else LabLog.i("cf", "已回灌历史 cookie " + total + " 字节（clearance=" + hasAnyClearance() + "）")
     }
 
-    /** 兼容旧名字（LabInit / LoginActivity 里用过）。 */
+    private fun hasAnyClearance(): Boolean = HOSTS.any { hasPersistedFor(it) }
+
+    /** 兼容旧名字。 */
     fun restoreLoginAtStartup() = restoreAtStartup()
 
     /**
-     * 旧接口：往上游 `HanimeClient.cookieMap` 里塞。
+     * 旧接口：判断是不是登录串/clearance 串并分别落盘。
      *
-     * **现在只做落盘**，不再碰 cookieMap —— 详见类注释。
-     * 保留同名同签名，是为了不让既有调用点全部改一遍（那些调用点分布在
-     * patches.py 生成的 2400 行文件里，改一处就要动一个补丁锚点）。
+     * **现在按 url 的域存**（旧版一律存给 hanime1.me，导致 javchu 永远没有凭据）。
      */
     fun importIntoClient(url: String, cookieHeader: String) {
         if (cookieHeader.isBlank()) return
-        // 判断是不是登录串：含 session / remember_web 就当登录态存
+        val h = hostOf(url)
         if (cookieHeader.contains("hanime1_session") || cookieHeader.contains("remember_web")) {
-            persistLogin(cookieHeader)
+            persistLoginFor(h, cookieHeader)
         }
         if (cookieHeader.contains("cf_clearance") || cookieHeader.contains("__cf_bm")) {
-            persist(cookieHeader)
+            persistFor(h, cookieHeader)
         }
-        // 两样都不含（只有零散 cookie）也存进 extra，别丢
         if (!cookieHeader.contains("hanime1_session") &&
             !cookieHeader.contains("remember_web") &&
             !cookieHeader.contains("cf_clearance") &&
             !cookieHeader.contains("__cf_bm")
         ) {
-            write(K_EXTRA_COOKIE, mergeCookie(read(K_EXTRA_COOKIE), cookieHeader))
+            write(K_EXTRA, h, mergeCookie(read(K_EXTRA, h), cookieHeader))
+            bumpVersion()
         }
     }
 }

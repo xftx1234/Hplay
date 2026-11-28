@@ -94,52 +94,76 @@ object HplayGetchu {
      * @return 永不为 null：失败时 [Page.error] 是**人话原因**（界面据此如实显示）
      */
     fun load(monthCode: String): Page {
+        // 命中缓存直接返回（来回翻月份 / 返回列表再进来都不重新握手）
+        monthCache[monthCode]?.let { (g, ts) ->
+            if (System.currentTimeMillis() - ts < MONTH_TTL_MS) {
+                return Page(monthCode, g, if (g.isEmpty()) "该月份没有预告商品（${monthLabel(monthCode)}）" else "")
+            }
+        }
         val html = runCatching { fetch(urlOf(monthCode)) }.getOrElse { t ->
             return Page(monthCode, emptyList(), "请求失败：${t.message ?: t}")
         }
         val groups = runCatching { parse(html) }.getOrElse { t ->
             return Page(monthCode, emptyList(), "解析失败：${t.message ?: t}")
         }
+        if (groups.isNotEmpty()) monthCache[monthCode] = groups to System.currentTimeMillis()
         val err = if (groups.isEmpty()) "该月份没有预告商品（${monthLabel(monthCode)}）" else ""
         return Page(monthCode, groups, err)
     }
 
+    /**
+     * **专用客户端**（第 355 轮 · 修「getchu 加载慢」）。
+     *
+     * 上一版每次都用 `HttpURLConnection` 新建连接：
+     *   · 一页预告 = 1 次 TCP + 1 次 TLS（经内置节点还要多一跳 SOCKS）；
+     *   · 点进详情 = 又一次全新握手；返回再进 = 再来一次。
+     * 实测「列表 → 详情 → 返回 → 详情」四步要 4 次完整握手，而 getchu 在日本，
+     * 单次握手 1.5~3 秒 —— 这就是用户感到的「慢」。
+     *
+     * 现在从 [com.javrocket.hanime.HanimeClient.http] `newBuilder()` 派生：
+     *   · 继承连接池（48 条 / 15 分钟）：同一台服务器第二次请求直接复用 TCP+TLS；
+     *   · 继承代理选择器（内置节点 / 直连按 GlobalProxy 判），与其它板块同一套出网口径；
+     *   · 超时收紧：连不上就早失败（20s/25s 的旧值在节点抖动时会白等半分钟）。
+     *
+     * 不设 `Accept-Encoding`：让 OkHttp 自己协商 gzip 并**自动解压**
+     *（手工设了它就不再自动解压，旧代码才需要手写 GZIPInputStream）。
+     */
+    private val http: okhttp3.OkHttpClient by lazy {
+        com.javrocket.hanime.HanimeClient.http.newBuilder()
+            .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
+    /** 月份页缓存（10 分钟）：来回翻月份、返回列表时不再重复握手。 */
+    private val monthCache = java.util.concurrent.ConcurrentHashMap<String, Pair<List<Group>, Long>>()
+    private const val MONTH_TTL_MS = 10 * 60_000L
+
+    /** 详情页缓存（30 分钟）：在详情与列表间来回点时秒开。 */
+    private val detailCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Detail, Long>>()
+    private const val DETAIL_TTL_MS = 30 * 60_000L
+
     /** GET 取页面，**按 EUC-JP 解码**（照参考实现的 GETCHU_CHARSET）。 */
     private fun fetch(url: String): String {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 20000
-            readTimeout = 25000
-            instanceFollowRedirects = true
-            setRequestProperty("User-Agent", UA)
-            setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-            setRequestProperty("Accept-Language", "ja,en;q=0.8")
-            setRequestProperty("Accept-Encoding", "gzip")
-            setRequestProperty("Cache-Control", "no-cache")
-            // ★ 第 77 轮真机踩坑：**不带这个 Cookie，详情页会返回「年齢認証ページ」（年龄验证页）**，
-            //   于是标题解析成「年齢認証ページ」、正文全空。
+        val req = okhttp3.Request.Builder()
+            .url(url)
+            .header("User-Agent", UA)
+            .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+            .header("Accept-Language", "ja,en;q=0.8")
+            .header("Cache-Control", "no-cache")
+            // ★ 第 77 轮真机踩坑：**不带这个 Cookie，详情页会返回「年齢認証ページ」**，
             //   参考实现正是用 GetchuInterceptor 给所有请求加这个 cookie（此处照抄）。
-            setRequestProperty("Cookie", "getchu_adalt_flag=getchu.com; gc=gc")
-            setRequestProperty("Referer", "https://www.getchu.com/")
-        }
-        try {
-            val code = conn.responseCode
+            .header("Cookie", "getchu_adalt_flag=getchu.com; gc=gc")
+            .header("Referer", "https://www.getchu.com/")
+            .build()
+        http.newCall(req).execute().use { resp ->
+            val code = resp.code
             if (code !in 200..299) throw IllegalStateException("HTTP $code")
-            val raw = conn.inputStream.use { ins ->
-                val body = if ((conn.contentEncoding ?: "").contains("gzip", true)) GZIPInputStream(ins) else ins
-                val bos = ByteArrayOutputStream()
-                val buf = ByteArray(1 shl 16)
-                while (true) {
-                    val n = body.read(buf)
-                    if (n <= 0) break
-                    bos.write(buf, 0, n)
-                }
-                bos.toByteArray()
-            }
+            val raw = resp.body?.bytes() ?: ByteArray(0)
+            if (raw.isEmpty()) throw IllegalStateException("HTTP $code（空正文）")
             // ★ EUC-JP（实测：按 utf-8 解码会失败，按 euc-jp 成功且「発売」等关键词命中）
             return String(raw, Charset.forName("EUC-JP"))
-        } finally {
-            runCatching { conn.disconnect() }
         }
     }
 
@@ -184,12 +208,17 @@ object HplayGetchu {
      * @return 永不为 null；失败时 [Detail.error] 是人话原因。
      */
     fun loadDetail(id: String): Detail {
+        detailCache[id]?.let { (d, ts) ->
+            if (System.currentTimeMillis() - ts < DETAIL_TTL_MS) return d
+        }
         val html = runCatching { fetch(detailUrlOf(id)) }.getOrElse { t ->
             return Detail(id, "", "", "", "", "", emptyList(), detailUrlOf(id), "请求失败：${t.message ?: t}")
         }
-        return runCatching { parseDetail(html, id) }.getOrElse { t ->
+        val d = runCatching { parseDetail(html, id) }.getOrElse { t ->
             Detail(id, "", "", "", "", "", emptyList(), detailUrlOf(id), "解析失败：${t.message ?: t}")
         }
+        if (d.error.isBlank()) detailCache[id] = d to System.currentTimeMillis()
+        return d
     }
 
     private val IMG_RE = Regex("<img[^>]*src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)

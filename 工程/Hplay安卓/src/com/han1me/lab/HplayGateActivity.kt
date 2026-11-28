@@ -250,56 +250,91 @@ class HplayGateActivity : Activity() {
         }
     }
 
+    /**
+     * 把**每个受管域**当前的 cookie 一次读出来（第 355 轮）。
+     *
+     * 照 Han1mePlus 的 `WebViewCookieBridge.read(urls)`：
+     * 它把 `hanime1.me / hanime1.com / hanimeone.me / javchu.com` 四个域的 cookie
+     * 一起读出来。用户要求「在最初 cf 验证时就一次解决所有带 cf 验证的相关问题」，
+     * 这正是那一条的实现 —— 用户只点一次验证，四个域的 clearance 全部落盘。
+     *
+     * @return host -> 该域整串 cookie（只含非空的）
+     */
+    private fun readAllHostCookies(): Map<String, String> {
+        val cm = runCatching { CookieManager.getInstance() }.getOrNull() ?: return emptyMap()
+        val out = LinkedHashMap<String, String>()
+        for (h in CfCookieBridge.HOSTS) {
+            val raw = runCatching { cm.getCookie("https://$h/") }.getOrNull().orEmpty()
+            if (raw.isNotBlank()) out[h] = raw
+        }
+        return out
+    }
+
     /** 把当前状态写到提示行（哪一步已经完成）。 */
     private fun refreshStatus() {
-        val cookies = runCatching {
-            CookieManager.getInstance().getCookie("https://hanime1.me/")
-        }.getOrNull().orEmpty()
-        val hasCf = cookies.contains("cf_clearance")
-        val hasLogin = cookies.contains("hanime1_session") || cookies.contains("remember_web") ||
+        val all = readAllHostCookies()
+        val cfHosts = all.filterValues { it.contains("cf_clearance") }.keys
+        val main = all["hanime1.me"].orEmpty()
+        val hasLogin = main.contains("hanime1_session") || main.contains("remember_web") ||
             loginDetected.get()
+        val cfTxt = if (cfHosts.isEmpty()) "" else "（" + cfHosts.joinToString("、") + "）"
         status?.text = when {
-            hasCf && hasLogin -> "✅ 验证已通过 · 已登录 —— 可以点「完成」"
-            hasCf -> "✅ 验证已通过（未登录；需要账号就点页面里的登录）"
+            cfHosts.isNotEmpty() && hasLogin -> "✅ 验证已通过" + cfTxt + " · 已登录 —— 可以点「完成」"
+            cfHosts.isNotEmpty() -> "✅ 验证已通过" + cfTxt + "（未登录；需要账号就点页面里的登录）"
             hasLogin -> "已登录 · 验证标记未出现（点「完成」会一并保存）"
             else -> "⏳ 正在通过验证，请稍候…"
         }
     }
 
-    /** 一次性取全（clearance + 登录），落盘，结束。 */
+    /**
+     * 一次性取全（**所有受管域的 clearance** + 登录），落盘，结束。
+     *
+     * ★ 第 355 轮（用户要求「在最初 cf 验证时就一次解决所有带 cf 验证的相关问题」）：
+     * 旧版只读 `hanime1.me` 一个域。于是 javchu.com 虽然也在 WebView 里、虽然也可能
+     * 已经被 CF 放过，它的 clearance **从来没有被取走** —— 换节点后 javchu 页面 403，
+     * 桥里没有任何凭据可以重放，用户看到的则是「关注时好时坏」。
+     *
+     * 现在按 [CfCookieBridge.HOSTS] 逐域读取：有 clearance 的存 clearance，
+     * 有会话标记的存登录层；登录/账户表的处理仍只看 hanime1.me（账号体系在那边）。
+     */
     private fun captureAndFinish() {
         if (!done.compareAndSet(false, true)) return
-        val cookies = runCatching {
-            CookieManager.getInstance().getCookie("https://hanime1.me/")
-        }.getOrNull().orEmpty()
         runCatching { CookieManager.getInstance().flush() }
-        LabLog.i("gate", "取到 cookie " + cookies.length + " 字节")
+        val all = readAllHostCookies()
+        val cookies = all["hanime1.me"].orEmpty()
+        LabLog.i("gate", "取到 cookie 域数=" + all.size + " 主域=" + cookies.length + " 字节")
 
-        if (cookies.isNotBlank()) {
-            if (cookies.contains("cf_clearance")) {
-                CfCookieBridge.persist(cookies)
-                HplayCfHolder.markCleared("https://hanime1.me/")
-                HplayCfHolder.endCooldown("hanime1.me")
-            }
-            val logged = cookies.contains("hanime1_session") || cookies.contains("remember_web") ||
-                loginDetected.get()
-            if (logged) {
-                CfCookieBridge.importIntoClient("https://hanime1.me/", cookies)
-                CfCookieBridge.persistLogin(cookies)
-                LoginState.beginLoadingAccount()
-                LoginState.notifyChanged()
-                saveAccount(cookies)
-                Thread({
-                    runCatching {
-                        kotlinx.coroutines.runBlocking {
-                            InstantAccountLoader.loadNow(com.javrocket.hanime.HanimeClient.http)
-                        }
-                    }
-                }, "hplay-gate-account").apply { isDaemon = true }.start()
-            }
-            // 验证态变了：之前 403 的请求该恢复了，清连接池
-            HplayCfHolder.clearPool()
+        // ---------- ① 逐域落盘 clearance ----------
+        var cfCount = 0
+        for ((h, raw) in all) {
+            if (!raw.contains("cf_clearance")) continue
+            cfCount++
+            CfCookieBridge.persistFor(h, raw)
+            HplayCfHolder.markCleared("https://$h/")
+            HplayCfHolder.endCooldown(h)
         }
+        LabLog.i("gate", "已落盘 clearance 的域：" + cfCount + "/" + all.size)
+
+        // ---------- ② 登录态（账号体系在 hanime1.me）----------
+        val logged = cookies.contains("hanime1_session") || cookies.contains("remember_web") ||
+            loginDetected.get()
+        if (logged && cookies.isNotBlank()) {
+            CfCookieBridge.importIntoClient("https://hanime1.me/", cookies)
+            CfCookieBridge.persistLogin(cookies)
+            LoginState.beginLoadingAccount()
+            LoginState.notifyChanged()
+            saveAccount(cookies)
+            Thread({
+                runCatching {
+                    kotlinx.coroutines.runBlocking {
+                        InstantAccountLoader.loadNow(com.javrocket.hanime.HanimeClient.http)
+                    }
+                }
+            }, "hplay-gate-account").apply { isDaemon = true }.start()
+        }
+        // 验证态变了：之前 403 的请求该恢复了，清连接池
+        HplayCfHolder.clearPool()
+        HplayCfHolder.clearNeedVerify()
         finishAndNotify(cookies)
     }
 

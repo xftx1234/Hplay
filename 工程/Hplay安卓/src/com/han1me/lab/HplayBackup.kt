@@ -82,6 +82,14 @@ object HplayBackup {
         root.put("loginCookie", CfCookieBridge.savedLogin())
         root.put("cfCookie", CfCookieBridge.savedClearance())
         root.put("extraCookie", CfCookieBridge.allCookieHeader())
+        // ★ 第 355 轮：cookie 改按域存之后，**必须逐域导出** —— 否则换机后
+        // javchu.com 的 clearance 丢失，用户又要在那个域上重新过一次盾。
+        val cfByHost = JSONObject()
+        for (h in CfCookieBridge.HOSTS) {
+            val one = CfCookieBridge.allCookieHeader("https://$h/")
+            if (one.isNotBlank()) cfByHost.put(h, one)
+        }
+        root.put("cfByHost", cfByHost)
 
         // 多账户（每个账户独立 cookie）
         root.put("accounts", AccountStore.exportJson(ctx))
@@ -188,6 +196,19 @@ object HplayBackup {
         }
         val extra = root.optString("extraCookie", "")
         if (extra.isNotBlank()) CfCookieBridge.importIntoClient("https://hanime1.me/", extra)
+
+        // ★ 第 355 轮：逐域恢复（新格式）。旧备份没有这个键，上面的三条老路径照旧生效。
+        val cfByHost = root.optJSONObject("cfByHost")
+        if (cfByHost != null) {
+            var hosts = 0
+            for (h in cfByHost.keys()) {
+                val one = cfByHost.optString(h, "")
+                if (one.isBlank()) continue
+                CfCookieBridge.importIntoClient("https://$h/", one)
+                hosts++
+            }
+            if (hosts > 0) { n++; detail.append("分域 cookie ").append(hosts).append(" 个、") }
+        }
 
         // ---------- ② 多账户 ----------
         val accs = root.optString("accounts", "")

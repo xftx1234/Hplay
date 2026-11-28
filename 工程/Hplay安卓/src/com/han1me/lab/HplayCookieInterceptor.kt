@@ -4,43 +4,32 @@ import okhttp3.Interceptor
 import okhttp3.Response
 
 /**
- * **每次都补 Cookie 的拦截器**（2026-11-25 第 322 轮新增）。
+ * **每次都按域补 Cookie 的拦截器**（2026-11-25 第 322 轮新增；第 355 轮改为按域）。
  *
  * ## 这一条是「CF 过一次全部不用重新验证」的核心
  *
- * 两个参考项目都是这个模型：
+ * 参考实现（Han1meViewer · HCookieJar.loadForRequest）是**每次请求**都按 `url.host`
+ * 把 login + cloudflare 两串合并进去 —— cookie 不是"导入一次"，而是"每次都带"。
  *
- * ```kotlin
- * // Han1meViewer · HCookieJar.loadForRequest
- * cookies.addAll(Preferences.loginCookieStateFlow.value.toLoginCookieList(host))
- * cookies.addAll(Preferences.cloudFlareCookieStateFlow.value.toLoginCookieList(host))
- * ```
+ * ## 第 355 轮：从「只服务 hanime1.me」改成「按域服务所有 CF 前置站」
  *
- * 也就是：**cookie 不是"导入一次"，而是"每次请求都合并"**。
+ * 旧版第一句是 `if (!host.endsWith("hanime1.me")) return chain.proceed(req)`，
+ * 于是 `javchu.com` 也是 Cloudflare 前置、也有自己的 `cf_clearance`，但这条拦截器
+ * 根本不管它 —— 换节点后 javchu 页面 403 时，连"带着 clearance 重放一次"的机会都没有。
+ * 用户看到的就是「关注功能随内置节点网络变化而时好时坏」。
  *
- * 旧实现靠 `CfCookieBridge.importIntoClient` 往 `HanimeClient.cookieMap` 塞一次，
- * 而那个 map 有两条硬编码会破坏 clearance：
+ * 现在：只要该 host 在 [CfCookieBridge.HOSTS] 里、或桥里确实存过它的 cookie，就合并；
+ * 并且**按 host 收 Set-Cookie**（CF 续期 clearance 就是在这里落盘的）。
  *
- * 1. 导入时 `if (k.startsWith("_")) continue` —— 丢掉 `__cf_bm` / `_cfuvid`；
- * 2. 发请求时 `filterKeys { !it.startsWith("_") }` —— 再次丢掉；
- * 3. 域/路径硬编码成 `hanime1.me` + `/`，抹平了 WebView 里的 Path 语义。
- *
- * 现在改成：上游 jar 怎么处理都不管，**在应用层拦截器里把整串 Cookie 头盖上去**。
- * 上游 map 里那部分照样带着（我们只覆盖/追加同名项）。
- *
- * ## 顺手收 Set-Cookie
- *
- * CF 每次校验通过都会**刷新** `cf_clearance` 的到期时间（响应头带回新的值）。
- * 拦截器在这里把响应里的 Set-Cookie 交给 [CfCookieBridge.harvest] 落盘 ——
- * 只要 App 还在用，clearance 就一直续着，不会「隔几小时又弹一次」。
+ * 其它域（板块 CDN、图床）一条都不碰 —— 它们的鉴权与我们无关，多带 cookie 反而是越权。
  */
 class HplayCookieInterceptor : Interceptor {
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val req = chain.request()
-        // 只对本站生效：这条链虽然只发 hanime1.me，但保留判据防止将来复用
         val host = req.url.host.lowercase()
-        if (!host.endsWith("hanime1.me")) return chain.proceed(req)
+        val managed = isManaged(host)
+        if (!managed) return chain.proceed(req)
 
         val ours = CfCookieBridge.allCookieHeader(req.url.toString())
         val next = if (ours.isBlank()) {
@@ -54,12 +43,20 @@ class HplayCookieInterceptor : Interceptor {
 
         val resp = chain.proceed(next)
 
-        // 收集 Set-Cookie（CF 刷新 clearance 就在这里）
+        // 收集 Set-Cookie（CF 刷新 clearance 就在这里）。★ 必须按 host 收。
         runCatching {
             val setCookies = resp.headers("Set-Cookie")
-            if (setCookies.isNotEmpty()) CfCookieBridge.harvest(setCookies)
+            if (setCookies.isNotEmpty()) CfCookieBridge.harvestFor(host, setCookies)
         }
 
         return resp
+    }
+
+    /** 该 host 是否归桥管理（避免把 hanime1 的会话发给无关的站）。 */
+    private fun isManaged(host: String): Boolean {
+        for (d in CfCookieBridge.HOSTS) {
+            if (host == d || host.endsWith("." + d)) return true
+        }
+        return false
     }
 }

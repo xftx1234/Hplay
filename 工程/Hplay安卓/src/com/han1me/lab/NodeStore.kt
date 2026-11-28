@@ -62,7 +62,7 @@ object NodeStore {
      * 机制：启动时比对存储里的 epoch 与这里的值，不一致就**强制重建默认节点**并写回新值。
      * 以后每次换默认节点，把这个数字加一即可。
      */
-    const val NODE_EPOCH = 2026112402
+    const val NODE_EPOCH = 2026112801
 
     fun attach(dataDir: File) {
         if (file == null) file = File(dataDir, FILE_NAME)
@@ -441,9 +441,27 @@ object NodeStore {
      * 恢复后用户在「网络」设置里能看到多个节点可选；
      * DEFAULT_NODE_URL（用户指定的 L4-0x）仍然是**默认选中**的那一个。
      */
-    // ★ 2026-11-25（第 308 轮）：**清空所有预设节点**（用户要求）。
-    // 只保留 DEFAULT_NODE_URL（用户指定的 L4-0x）作为唯一节点。
-    val PRESET_NODES: List<String> = emptyList()
+    // ★ 2026-11-25（第 308 轮）：清空所有预设节点（用户要求）。
+    // 只保留 DEFAULT_NODE_URL（用户指定的 L4-0x）作为默认节点。
+    //
+    // ★★★ 第 355 轮（用户给出实测节点，要求「你看一下」）：**新增新加坡 Reality 节点作为可选备选**。
+    //
+    // 为什么要加：javchu 的媒体 CDN（tNN.cdn2020.com）对**出口 IP** 极其敏感 ——
+    // 实测同一个 index.m3u8：本机/手机直连在不同时段返回 200 / 206+1字节 / 451 / 404 四种，
+    // 而经美西节点（35.89.113.126）一律 451（Server: Quantum）。
+    // 也就是说「能不能原生播放 javchu」这件事**本质由出口 IP 决定**，不是代码能决定的，
+    // 唯一可行的做法是让用户手上有一个**多条出口**可切。
+    //
+    // 本条为用户 2026-11-28 给出的实测链接（逐字符照抄，仅去掉 # 名称片段后重取名）。
+    // 它**不是默认节点**（默认仍是 L4-0x 美西）—— 用户可自行在「网络」里切换对比。
+    const val USER_NODE_SG =
+        "vless://9a8a0cca-88a0-4437-a29d-399984b3a0fc@94.118.188.157:443/" +
+            "?type=tcp&encryption=none&flow=xtls-rprx-vision" +
+            "&sni=www.singtel.com&fp=firefox&security=reality" +
+            "&pbk=g2CgRdvmuQdRXofxbJKz7C0fxcHi91pldQ4YkUuhvUQ&sid=ffeb598c" +
+            "&packetEncoding=xudp#%F0%9F%87%B8%F0%9F%87%ACL3-0.3x%20%E6%96%B0%E5%8A%A0%E5%9D%A1%C2%B7%E5%B7%A7%E5%85%8B%E7%94%9C%E7%88%B1"
+
+    val PRESET_NODES: List<String> = listOf(USER_NODE_SG)
 
     /** 从预设节点 URL 列表生成 LabNode 列表（自动取名）。 */
     private fun presetLabNodes(): List<LabNode> = PRESET_NODES.map { LabNode(nameOf(it), it) }
@@ -457,11 +475,18 @@ object NodeStore {
             val storedEpoch = load().getProperty("lab.node.epoch", "0")?.toIntOrNull() ?: 0
             if (storedEpoch != NODE_EPOCH) {
                 LabLog.i("node", "节点纪元变更 " + storedEpoch + " -> " + NODE_EPOCH + "，强制重建默认节点")
-                val fresh = SubSource(
-                    FIXED_SUB_NAME,
-                    FIXED_SUB_URL,
-                    listOf(LabNode(nameOf(DEFAULT_NODE_URL), DEFAULT_NODE_URL)),
-                )
+                // ★ 第 355 轮：纪元重建时**保留用户自己加的节点**（只重建默认+预设部分）。
+                // 原来的写法直接覆盖整条订阅 —— 用户手动添加的节点会被清掉，
+                // 而这一轮加预设节点必须走重建分支，不能顺手把别人的节点删了。
+                val prevNodes = runCatching {
+                    subs().firstOrNull { isFixedSub(it) }?.nodes.orEmpty()
+                }.getOrDefault(emptyList())
+                val keep = prevNodes.filter { n ->
+                    n.url != DEFAULT_NODE_URL && n.url !in PRESET_NODES
+                }
+                val rebuilt = (listOf(LabNode(nameOf(DEFAULT_NODE_URL), DEFAULT_NODE_URL)) +
+                    presetLabNodes() + keep).distinctBy { it.url }
+                val fresh = SubSource(FIXED_SUB_NAME, FIXED_SUB_URL, rebuilt)
                 val list = subs().toMutableList()
                 val i0 = list.indexOfFirst { isFixedSub(it) }
                 if (i0 >= 0) list[i0] = fresh else list.add(0, fresh)
@@ -481,7 +506,8 @@ object NodeStore {
                 //   否则用户加进去的节点每次启动都会被冲掉。）
                 val old = list[idx]
                 val extra = old.nodes.filter { it.url != DEFAULT_NODE_URL && it.url !in PRESET_NODES }
-                val merged = listOf(defaultNode) + extra
+                val merged = (listOf(defaultNode) + presetLabNodes() + extra)
+                    .distinctBy { it.url }
                 if (merged != old.nodes || old.name != FIXED_SUB_NAME || idx != 0) {
                     list.removeAt(idx)
                     list.add(0, SubSource(FIXED_SUB_NAME, FIXED_SUB_URL, merged))

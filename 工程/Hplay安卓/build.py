@@ -427,6 +427,16 @@ def upstream():
         sys.stdout.write(_r352.stderr or "")
         raise SystemExit("[第352轮规则未通过] 构建已中止")
 
+    # ★ 第 355 轮：**CF cookie 按域 + javchu 媒体预检判真**（规则在 tools/round355.py）。
+    _r355 = subprocess.run([sys.executable, str(ROOT / "tools" / "round355.py")],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+    for line in (_r355.stdout or "").splitlines():
+        if line.strip():
+            print(line)
+    if _r355.returncode != 0:
+        sys.stdout.write(_r355.stderr or "")
+        raise SystemExit("[第355轮规则未通过] 构建已中止")
+
     # ★★★ 第 334 轮：**日志拦截器接线**（gen + src 两处都要）。
     #
     # 全项目 14 个 OkHttpClient.Builder（gen 8 + src 6），逐个手改不可维护。

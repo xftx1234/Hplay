@@ -12,64 +12,36 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * **关注 / 取关作者**（第 345 轮建立，第 347 轮改为页面内 fetch，第 348 轮改为**预热 + 即时提交**）。
+ * **关注 / 取关作者**（第 345 轮建立；第 347/348 轮改页面内 fetch；**第 355 轮加 OkHttp 快路**）。
  *
- * ## 真机证据链（按轮次累积，别删）
+ * ## 第 355 轮为什么改（用户原话）
  *
- * @@
- * [11:27:22.448] GET  hanime1.me/          -> 200  Server=cloudflare
- * [11:27:22.937] POST hanime1.me/subscribe -> 403  Cf-Mitigated=challenge
- * @@
+ * 「关注功能会随内置节点网络变化而出现无法关注问题，优化机制，让 cookie 可实现包含
+ *   全部云端账户请求，或者在最初 cf 验证时就一次解决所有带 cf 验证的相关问题」。
  *
- * 第 347 轮排除掉「请求头」方向：同一台机器试了**四种**头部形态
- * （文档导航式 / Plus 式带 XHR / Viewer 式最精简 / 桌面 UA），**全部 403**；
- * CloudflareInterceptor 每次都重放过一次，重放仍被挑战。同时段 GET 全是 200。
- * 结论：cf_clearance 对**非导航的 POST** 不生效，CF 的 WAF 只放行页面上下文里发起的请求。
+ * 上一版**只有一条路**：起一个不可见 WebView、在页面上下文里 fetch。它的失败面很大：
  *
- * ## 第 348 轮：为什么之前"点了要卡几秒"
+ *  · 页面被 CF 挑战（换节点后常发生）⇒ 页面里没有 `#video-subscribe-form`，fetch 无从发起；
+ *  · WebView 冷启动 + 十几个第三方资源 ⇒ 2~4 秒，用户以为没点上；
+ *  · 会话被回收 / 主线程忙 ⇒ 轮询拿不到回包，报「页面内 fetch 无回包」。
  *
- * 真机日志（2026-11-27 16:28:38 - 16:28:45）把 7 秒拆得清清楚楚：
+ * 而同一批日志里 **`POST hanime1.me/like -> 200`** 是通的 —— 说明在这个节点上，
+ * 带 clearance 的 OkHttp POST 本来就能过 CF。所以正确做法是**两条路都留着，先走快的那条**：
  *
- * @@
- * 16:28:38.645  POST /subscribe -> 403      <- OkHttp 形态 0
- * 16:28:39.366  GET  hanime1.me/ -> 200                                          (0.7s)
- * 16:28:40.589  POST /subscribe -> 403      <- 形态 1                             (1.2s)
- * 16:28:41.312  GET  hanime1.me/ -> 200
- * 16:28:42.329  POST /subscribe -> 403      <- 形态 2                             (1.1s)
- * 16:28:42.950  GET  hanime1.me/ -> 200
- * 16:28:44.072  POST /subscribe -> 403      <- 形态 3                             (1.1s)
- * 16:28:45.200  GET  watch?... -> 200      <- WebView 这时才开始加载详情页
- * ... 页面挂 hCaptcha / jsdelivr / gstatic / 广告等十几个第三方资源 ...
- * @@
+ * ```
+ *  ① OkHttp 直提（<300ms）   —— 成了就结束；403/挑战才继续
+ *  ② WebView 页面内 fetch     —— 真正的兜底（浏览器的 TLS 指纹 + 页面上下文）
+ *  ③ 两条都不行               —— 如实报错，并提示去首页过一次盾
+ * ```
  *
- * 三个真凶，全部在本轮修掉：
+ * ## 一秒卡顿（用户第 2 点）
  *
- * ① **四次注定失败的 OkHttp 重试白烧 6.3 秒**。
- *    它们从来不会成功（WAF 语义决定），每轮还要先 GET 一次首页刷 CSRF 令牌。
- *    本轮**整段删除**，直接走页面内提交。
+ * 上一版在**成功后仍把那个全屏 WebView 挂着 90 秒**（LINGER_MS，为"用户可能再点一次"设计）。
+ * 它的 alpha 只有 0.01，但 **alpha 不影响合成开销** —— 详情页上永远压着一层全屏渲染层，
+ * 主线程每次重组都要多算一层，于是"关注成功后卡一下"。
  *
- * ② **WebView 在点击那一刻才冷启动**。加载详情页 + 十几个第三方资源本身要 2-4 秒。
- *    本轮改成**打开详情页时预热**（[prewarm]）：用户读简介、决定要不要关注的这几秒里，
- *    页面已经在后台加载好了；真点下去时只差一次 fetch。
- *
- * ③ **轮询间隔 1200ms**（第 347 轮的 onPageReady）。
- *    fetch 本身只要 200-400ms，却被 1.2 秒的轮询粒度拖成"至少等一档"。
- *    本轮改成 **70ms** 轮询、首轮立即执行。
- *
- * 顺带修掉一个用户能直接感觉到的 bug：
- * ④ 不可见 WebView 之前用 addView(fl, params) 加在 **decorView 最上层**，
- *    全屏尺寸 + alpha 0.01 —— **alpha 不影响触摸派发**，于是那 4 秒里用户在详情页
- *    的任何点击都被这个看不见的 WebView 吃掉。本轮改为 addView(fl, 0, params)
- *    压到 z 序最底，并且 isClickable/isFocusable 全关。
- *
- * ## 期望时间线（预热命中时）
- *
- * @@
- * 点击 -> evaluateJavascript(填表 + fetch)  ~20ms
- *      -> 页面 fetch 往返                    ~250ms
- *      -> 轮询读到状态码（70ms 粒度）         ~70ms
- * 合计 ~0.35s，且按钮在按下瞬间就已翻转（乐观更新，见 patch_subscribe_instant）
- * @@
+ * 现在：**成功/失败都已定论就立刻降为短回收（600ms）**，下次点关注重新预热即可
+ *（预热本身在打开详情页时就跑了，用户感受不到）。
  *
  * ## WebView 的四项配置（缺一项都过不去 CF 挑战页）
  *
@@ -82,33 +54,48 @@ import java.util.concurrent.TimeUnit
  * ## 纪律
  *
  * · WebView 在主线程创建（Android 硬要求）；调用线程用 latch 等，有硬超时；
- * · 1x1 不行（挑战脚本不跑），要有真实 viewport；alpha 用 0.01 不用 0f
- *   （0f 会被 JS 判定为不可见）；
+ * · 1x1 不行（挑战脚本不跑），要有真实 viewport；alpha 用 0.01 不用 0f；
  * · 任何异常都返回 false/抛异常，由调用方如实提示，不假装成功。
  */
 object HplaySubscribe {
 
-    /** 单次提交的整体超时（秒）。预热命中时 0.4 秒就结束，这里是兜底。 */
-    private const val TIMEOUT_S = 8L
+    /**
+     * 单次提交的整体超时（秒）。
+     *
+     * ★ 第 355 轮真机实测校准：冷启动（代理 → 建 WebView → 加载详情页 → 探针就绪）实测 7.2 秒，
+     * 再加一次页面内 fetch 1.2 秒 ≈ 8.5 秒。上一版给 10 秒 —— 只差 1.5 秒就踩线，
+     * 真机上「第二次点关注」直接报「超时 10s」（20:50:09 日志实锤）。
+     * 现在给 20 秒：预热命中时仍然是 0.3~1.3 秒结束，只有冷启动才会用到这个上限。
+     */
+    private const val TIMEOUT_S = 20L
 
-    /** 轮询粒度（毫秒）。第 347 轮是 1200，这就是"卡几秒"的第三个原因。 */
+    /** OkHttp 快路的超时（秒）：超了就转 WebView，不再等。 */
+    private const val QUICK_TIMEOUT_S = 8L
+
+    /** 轮询粒度（毫秒）。 */
     private const val POLL_MS = 70L
 
     /** 轮询上限次数：70ms x 110 约 7.7 秒。 */
     private const val POLL_MAX = 110
 
-    /**
-     * 预热页**空闲保留**时长。
-     *
-     * 第 348 轮第一版给的是 25 秒 —— 真机实测踩坑：用户读简介超过 25 秒
-     * （这不是慢，这是正常阅读），页面正好在点下去那一刻被回收，
-     * 于是又走一遍「冷启动 WebView + 加载详情页」，回到 3 秒。
-     * 90 秒足够覆盖「看简介 - 想一下 - 点关注」的正常节奏。
-     */
+    /** 预热延迟：让详情页先画出来，别在首帧上建 WebView。 */
+    private const val PREWARM_DELAY_MS = 900L
+
+    /** 预热页**空闲保留**时长（用户还在读简介时别回收）。 */
     private const val LINGER_MS = 90_000L
 
-    /** **离开详情页**后的回收延时（比空闲保留短得多：用户已经走了）。 */
+    /** **离开详情页**后的回收延时。 */
     private const val RELEASE_MS = 6_000L
+
+    /** ★ 第 355 轮：**操作已定论后的回收延时**（修"关注成功后卡一秒"）。 */
+    /**
+     * 操作已定论后的回收延时。
+     *
+     * 不能太短：用户「关注 → 发现点错了 → 立刻取关」是常见动作，页面还在就得复用；
+     * 也不能像原来那样挂 90 秒（那层全屏 WebView 一直压着，用户报「关注成功后卡一秒」）。
+     * 1.5 秒是权衡点：足够覆盖连点，又不让那层合成层长期存在。
+     */
+    private const val AFTER_DONE_MS = 1500L
 
     // ---------------- 会话（一个就够，同一时刻只可能看一个详情页） ----------------
 
@@ -117,12 +104,22 @@ object HplaySubscribe {
     @Volatile
     private var sess: Session? = null
 
+    /** 最近一次「本节点拒绝 POST」的 host（见 toggle 里的 skipQuick）。 */
+    @Volatile private var quickBlockedHost: String = ""
+
+    /** 最近一次「本节点拒绝 POST」的时间戳。 */
+    @Volatile private var quickBlockedAt: Long = 0L
+
     private class Session {
         var web: WebView? = null
         var holder: android.widget.FrameLayout? = null
         var url: String = ""
         var busy = false
         var dropped = false
+        /** ★ 第 355 轮：页面是否已 load 完成（未完成时提交必然"无回包"）。 */
+        @Volatile var loaded = false
+        /** ★ 第 355 轮：当前页面是不是 CF 挑战页（是的话 fetch 一定失败，直接报原因）。 */
+        @Volatile var challenged = false
         var linger: Runnable? = null
     }
 
@@ -131,35 +128,30 @@ object HplaySubscribe {
     // ---------------- 对外 API ----------------
 
     /**
-     * **预热**：打开详情页时调，后台把页面加载好，等用户真点关注时只差一次 fetch。
+     * 预热：打开详情页时调，后台把页面加载好。幂等。
      *
-     * 幂等：同一 URL 已就绪就直接返回。切到另一个详情页会重建。
+     * ★ 第 355 轮：**延迟 900ms 再建**。
+     *
+     * 上一版是立刻 `main.post { buildLocked() }` —— 而 createView 要在主线程 `new WebView`，
+     * 那是 200~600ms 的同步开销，正好压在详情页首帧组合上（用户报的「卡一下」）。
+     * 900ms 足够详情页画完两帧；用户读简介本来就要几秒，预热仍然赶得上。
      */
     fun prewarm(videoUrl: String) {
-        // 只预热**官方站**的详情页：关注表单只存在于 hanime1.me 的 watch 页。
-        // 板块源（三次元那些站）的 url 里没有这个表单，预热它纯属白耗流量与内存。
         if (videoUrl.isBlank()) return
+        // 只预热**官方站**的详情页：关注表单只存在于 hanime1.me 的 watch 页。
         if (!videoUrl.contains("hanime1.me")) return
-        main.post {
+        main.postDelayed({
             val cur = sess
             if (cur != null && !cur.dropped && cur.url == videoUrl) {
-                // 同一页：重置空闲计时即可（用户可能从相关影片点回来）
                 scheduleLingerLocked(cur, LINGER_MS)
-                return@post
+                return@postDelayed
             }
             dropLocked()
             buildLocked(videoUrl)?.let { scheduleLingerLocked(it, LINGER_MS) }
-        }
+        }, PREWARM_DELAY_MS)
     }
 
-    /**
-     * 兜底回收计时。
-     *
-     * 为什么需要它而不只靠 releaseLater：用户可能用系统返回手势退出详情页
-     * （BackHandler 直接把 detail 置 null，走不到 onClose），那样这个不可见 WebView
-     * 会一直挂着 —— 它占着一个渲染进程与若干个连接。统一由这里兜住：
-     * 无论怎么退出详情页，LINGER_MS 之后都回收。提交进行中（busy）时不回收。
-     */
+    /** 兜底回收计时（用户可能用返回手势退出详情页，走不到 releaseLater）。 */
     private fun scheduleLingerLocked(s: Session, delayMs: Long) {
         s.linger?.let { main.removeCallbacks(it) }
         val r = Runnable {
@@ -179,7 +171,7 @@ object HplaySubscribe {
     }
 
     /**
-     * 关注 / 取关。**立即**返回结果（预热命中时 < 0.5 秒）。
+     * 关注 / 取关。**先走 OkHttp 快路，失败再回落到 WebView 页面内 fetch**。
      *
      * @param videoUrl 详情页地址（WebView 要打开它才能拿到站方自己的表单）
      * @param userId   #video-subscribe-form 的 subscribe-user-id
@@ -195,9 +187,32 @@ object HplaySubscribe {
     ): Boolean {
         if (videoUrl.isBlank()) throw IllegalStateException("缺少详情页地址")
         if (userId.isBlank() || artistId.isBlank()) throw IllegalStateException("缺少关注所需的 id")
-        // subscribe-status：已关注发空串、未关注发 "1"（目标状态语义，照两个参考源码）
-        val status = if (subscribe) "" else "1"
 
+        // ---------- ① OkHttp 快路 ----------
+        //
+        // ★ 第 355 轮真机实测（20:44:09 日志）：同一节点上
+        //     GET  hanime1.me/          -> 200
+        //     POST hanime1.me/subscribe -> 403 Cf-Mitigated=challenge
+        // 也就是说这条路上**注定失败**，每点一次白烧 0.7 秒再回落到 WebView。
+        // 所以记住「本机这个节点刚拒过 POST」——5 分钟内直接走 WebView，不再试。
+        // 换节点 / 过盾后（HplayCfHolder.endCooldown）会清掉这条记忆。
+        val h = runCatching { java.net.URI(videoUrl).host.orEmpty().lowercase() }.getOrDefault("")
+        val skipQuick = h.isNotBlank() && h == quickBlockedHost &&
+            System.currentTimeMillis() - quickBlockedAt < 5 * 60_000L
+        if (!skipQuick) {
+            val quick = runCatching { quickHttp(videoUrl, userId, artistId, subscribe) }.getOrNull()
+            if (quick != null) {
+                LabLog.i("webpost", "注意：本次由 OkHttp 快路完成（不经 WebView）")
+                invalidateCaches()
+                recycleSoon()
+                return quick
+            }
+        } else {
+            LabLog.i("webpost", "本节点 5 分钟内拒过 POST，直接走页面内提交")
+        }
+
+        // ---------- ② WebView 页面内 fetch ----------
+        val status = if (subscribe) "" else "1"
         val latch = CountDownLatch(1)
         val out = booleanArrayOf(false)
         val note = arrayOf("")
@@ -221,27 +236,109 @@ object HplaySubscribe {
                 out[0] = ok
                 note[0] = why
                 latch.countDown()
+                // ★ 第 355 轮：定论后立刻降为短回收（修"成功后卡一秒"）
+                scheduleLingerLocked(s, AFTER_DONE_MS)
             }
         }
 
         val waited = runCatching { latch.await(TIMEOUT_S, TimeUnit.SECONDS) }.getOrDefault(false)
         val ok = waited && out[0]
         if (!ok) {
-            LabLog.i("webpost", "页面内提交失败：" + (if (waited) note[0] else "超时 " + TIMEOUT_S + "s"))
-            throw IllegalStateException("Cloudflare 挑战，页面内提交未通过" + if (note[0].isNotBlank()) "（" + note[0] + "）" else "")
+            val why = if (waited) note[0] else "超时 " + TIMEOUT_S + "s"
+            LabLog.i("webpost", "页面内提交失败：" + why)
+            throw IllegalStateException("关注没成功（" + why + "）。可在首页点「CF 验证」过一次盾再试")
         }
-        // 站点侧状态已变：清掉短缓存，让「我的订阅」与详情页下次重新抓
+        invalidateCaches()
+        recycleSoon()
+        return subscribe
+    }
+
+    /** 站点侧状态已变：清掉短缓存，让「我的订阅」与详情页下次重新抓。 */
+    private fun invalidateCaches() {
         runCatching { com.javrocket.hanime.HanimeClient.invalidateAllHtml() }
         runCatching { com.javrocket.hanime.HanimeClient.invalidateDetailCache() }
-        return subscribe
+    }
+
+    /** 立刻把预热页降为 600ms 后回收（幂等）。 */
+    private fun recycleSoon() {
+        main.post {
+            val s = sess ?: return@post
+            if (s.busy) return@post
+            scheduleLingerLocked(s, AFTER_DONE_MS)
+        }
+    }
+
+    /**
+     * **OkHttp 快路**：直接 POST /subscribe（与两个参考实现的字段完全一致）。
+     *
+     * @return 成功时的目标状态；**null = 没成（403 挑战 / 419 令牌 / 网络问题），应回落到 WebView**
+     */
+    private fun quickHttp(
+        videoUrl: String,
+        userId: String,
+        artistId: String,
+        subscribe: Boolean,
+    ): Boolean? {
+        val cli = runCatching {
+            com.javrocket.hanime.HanimeClient.http.newBuilder()
+                .connectTimeout(4, TimeUnit.SECONDS)
+                .readTimeout(QUICK_TIMEOUT_S, TimeUnit.SECONDS)
+                .callTimeout(QUICK_TIMEOUT_S, TimeUnit.SECONDS)
+                .build()
+        }.getOrNull() ?: return null
+
+        val token = runCatching { com.javrocket.hanime.HanimeClient.csrfTokenPublic() }
+            .getOrElse { return null }
+        if (token.isBlank()) return null
+        // 语义照两个参考源码：已关注发空串、未关注发 "1"（目标状态）
+        val status = if (subscribe) "" else "1"
+        val base = runCatching { com.javrocket.hanime.HanimeClient.baseUrlPublic() }
+            .getOrDefault("https://hanime1.me")
+        val form = okhttp3.FormBody.Builder()
+            .add("_token", token)
+            .add("subscribe-user-id", userId)
+            .add("subscribe-artist-id", artistId)
+            .add("subscribe-status", status)
+            .build()
+        val req = okhttp3.Request.Builder()
+            .url(base + "/subscribe")
+            .post(form)
+            .header("X-CSRF-TOKEN", token)
+            .header("Referer", videoUrl)
+            .header("Origin", base)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
+            .build()
+        val code = runCatching {
+            cli.newCall(req).execute().use { r ->
+                LabLog.i("webpost", "OkHttp 快路 -> HTTP " + r.code)
+                if (r.code == 403 || r.code == 419) {
+                    quickBlockedHost = runCatching { java.net.URI(videoUrl).host.orEmpty().lowercase() }
+                        .getOrDefault("")
+                    quickBlockedAt = System.currentTimeMillis()
+                }
+                if (r.code in 200..399) {
+                    val body = runCatching { r.body?.string().orEmpty() }.getOrDefault("")
+                    // 回包认得出就按它，认不出就按意图（与参考实现一致）
+                    val marked = Regex(
+                        """"?(?:subscribed|is_subscribed|subscribe_status)"?\s*[:=]\s*"?([01])""",
+                        RegexOption.IGNORE_CASE,
+                    ).find(body)?.groupValues?.get(1)
+                    return@use when (marked) {
+                        "1" -> true
+                        "0" -> false
+                        else -> subscribe
+                    }
+                }
+                null
+            }
+        }.getOrNull()
+        return code
     }
 
     // ---------------- 内部：建 / 拆 WebView ----------------
 
-    /**
-     * 后台把代理准备好再回主线程建 WebView —— CfForward.ensureStarted() 可能阻塞，
-     * 在主线程调会卡界面（这正是"点了卡一下"的观感来源之一）。
-     */
+    /** 后台把代理准备好再回主线程建 WebView（CfForward.ensureStarted 可能阻塞）。 */
     private fun buildLocked(videoUrl: String): Session? {
         val ctx = com.han1me.HplayEnv.applicationOrNull() ?: return null
         val s = Session()
@@ -254,6 +351,24 @@ object HplaySubscribe {
             } }
         }, "hpla-sub-prep").apply { isDaemon = true }.start()
         return s
+    }
+
+    /** 探一次「页面是否已能提交」（见 createView 里对进度的说明）。 */
+    private fun probeReady(w: WebView, s: Session) {
+        w.evaluateJavascript(
+            "(function(){var t=(document.title||'');" +
+                "var h=(document.body?document.body.innerHTML:'');" +
+                "if(document.getElementById('video-subscribe-form'))return 'ok';" +
+                "if(t.indexOf('Just a moment')>=0||t.indexOf('Attention Required')>=0)return 'cf';" +
+                "if(h.indexOf('challenge-platform')>=0)return 'cf';" +
+                "return 'noform';})()",
+        ) { v ->
+            val flag = (v ?: "").replace("\u0022", "").trim()
+            // noform 只有在主文档确实加载过之后才算结论；进度 75 时它通常已经在了。
+            s.challenged = flag == "cf"
+            s.loaded = flag == "ok" || flag == "noform"
+            LabLog.i("webpost", "页面探针 " + flag)
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -285,18 +400,30 @@ object HplaySubscribe {
                 LabLog.i("webpost", "WebView 代理 -> 127.0.0.1:" + port)
             }
         }
-        // 把 OkHttp 侧的登录 cookie 灌进来（CookieManager 与 cookieJar 不自动同步）
+        // 把 OkHttp 侧的 cookie 灌进来（CookieManager 与 cookieJar 不自动同步）
         runCatching {
             val raw = CfCookieBridge.allCookieHeader("https://hanime1.me/")
             if (raw.isNotBlank()) {
-                for (kv in raw.split(";")) {
+                for (kv in raw.split(';')) {
                     val one = kv.trim()
-                    if (one.isEmpty() || !one.contains("=")) continue
+                    if (one.isEmpty() || !one.contains('=')) continue
                     cm.setCookie("https://hanime1.me/", one)
                     cm.setCookie("https://.hanime1.me/", one)
                 }
                 cm.flush()
                 LabLog.i("webpost", "已灌入 cookie " + raw.length + " 字节")
+            }
+        }
+
+        // ★ 第 355 轮（真机 20:43:16 → 20:45:09 实测）：
+        // `onPageFinished` 要等**所有子资源**（hCaptcha / jsdelivr / 十几个广告）都结束，
+        // 那次花了 **113 秒**；而关注表单在 HTML 到达后 ~1 秒就已存在。
+        // 所以进度信号改用 `onProgressChanged >= 75`（主文档+关键资源已就绪），
+        // `onPageFinished` 只作为兜底补充。
+        w.webChromeClient = object : android.webkit.WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                if (newProgress < 75 || s.loaded || s.challenged) return
+                probeReady(view ?: return, s)
             }
         }
 
@@ -306,6 +433,10 @@ object HplaySubscribe {
                 request: android.webkit.WebResourceRequest,
             ): android.webkit.WebResourceResponse? =
                 runCatching { HplayWebProxy.intercept(request) }.getOrNull()
+
+            override fun onPageFinished(view: WebView, url: String?) {
+                if (!s.loaded && !s.challenged) probeReady(view, s)
+            }
         }
 
         // 真实尺寸（挑战脚本要 viewport）+ alpha=0.01（0f 会被判不可见）
@@ -324,8 +455,7 @@ object HplaySubscribe {
             s.dropped = true
             return
         }
-        // ④ 压到 z 序最底：alpha 0.01 不挡绘制，但**不挡触摸**，
-        //    加在最上层会让用户在详情页的那几秒点不动（第 347 轮真机可感知）。
+        // ④ 压到 z 序最底：alpha 0.01 不挡绘制，但**不挡触摸**
         dv.addView(fl, 0, android.view.ViewGroup.LayoutParams(fw, fh))
         s.web = w
         s.holder = fl
@@ -358,39 +488,10 @@ object HplaySubscribe {
         status: String,
         done: (Boolean, String) -> Unit,
     ) {
-        val w = s.web
-        if (w == null) {
-            // 视图还没建好（预热刚起）：等它就绪再提交，最多 4 秒
-            var waited = 0L
-            val t = object : Runnable {
-                override fun run() {
-                    val v = s.web
-                    if (v != null) {
-                        submitLocked(s, userId, artistId, status, done)
-                        return
-                    }
-                    waited += 100
-                    if (waited > 4000L || s.dropped) {
-                        done(false, "WebView 未就绪")
-                        return
-                    }
-                    main.postDelayed(this, 100)
-                }
-            }
-            main.postDelayed(t, 100)
-            return
-        }
-        // ★★★ 第 348 轮修（真机日志抓到的 bug）：**轮询器泄漏**。
-        //
-        // 上一版的 run() 末尾无条件 main.postDelayed(this, POLL_MS)，
-        // 而 done() 只是 countDown latch —— 轮询器自己并不知道已经结束，
-        // 于是**每 70 毫秒永久 evaluateJavascript 一次**。真机日志里同一个
-        // "页面内 fetch -> HTTP 200" 被打印了几十次、时间戳一路涨到 7770ms，
-        // 就是这个：主线程持续唤醒 + 持续和 WebView 通信，纯耗电。
-        // 现在用 finished 标志在所有出口拦住。
         var finished = false
         var tries = 0
         var firstFill = true
+        var waited = 0L
         val stop = { ok: Boolean, why: String ->
             if (!finished) {
                 finished = true
@@ -404,23 +505,42 @@ object HplaySubscribe {
                     stop(false, "会话已回收")
                     return
                 }
+                val w = s.web
+                if (w == null) {
+                    // 视图还没建好（预热刚起）：等它就绪再提交，最多 4 秒
+                    waited += 100
+                    if (waited > 4000L) {
+                        stop(false, "WebView 未就绪")
+                        return
+                    }
+                    main.postDelayed(this, 100)
+                    return
+                }
+                // ★ 第 355 轮：页面还没 load 完就提交，必然「无回包」—— 先等页面。
+                if (!s.loaded && !s.challenged) {
+                    waited += POLL_MS
+                    if (waited > 12_000L) {
+                        stop(false, "页面加载超时（预热未完成）")
+                        return
+                    }
+                    main.postDelayed(this, POLL_MS)
+                    return
+                }
+                if (s.challenged) {
+                    stop(false, "页面被 Cloudflare 挑战")
+                    return
+                }
                 if (tries++ > POLL_MAX) {
                     stop(false, "页面内 fetch 无回包")
                     return
                 }
-                // ★★★ 第 348 轮修（真机抓到）：**必须先复位再读状态**。
-                //
-                // 预热会话是**复用**的，上一次提交留下的 window.__hpSubCode = 200
-                // 会一直挂在页面里。第一轮就去读它，会立刻读到上一次的 200 ——
-                // 于是「提交」根本没发生，界面却报成功。真机实测第二次点击
-                // 只花 70ms 就"成功"，就是读到了这个陈旧值。
-                //
-                // 所以第一轮**只发复位 + 填表 + fetch**，不读结果；下一轮才开始读。
+                // 第一轮**只发复位 + 填表 + fetch**，不读结果（复用会话里可能有陈旧值）。
                 if (firstFill) {
                     firstFill = false
                     w.evaluateJavascript(jsFill(userId, artistId, status, true)) { v ->
                         val flag = v?.replace("\u0022", "").orEmpty()
                         if (flag.contains("err")) LabLog.i("webpost", "填表 " + flag.take(90))
+                        if (flag.contains("nof")) LabLog.i("webpost", "页面里没有关注表单")
                     }
                     main.postDelayed(this, POLL_MS)
                     return
@@ -429,9 +549,7 @@ object HplaySubscribe {
                     if (finished) return@evaluateJavascript
                     val code = raw?.replace("\u0022", "")?.trim()?.toIntOrNull() ?: -1
                     if (code > 0) {
-                        if (!finished) {
-                            LabLog.i("webpost", "页面内 fetch -> HTTP " + code + "（" + (tries * POLL_MS) + "ms）")
-                        }
+                        LabLog.i("webpost", "页面内 fetch -> HTTP " + code + "（" + (tries * POLL_MS) + "ms）")
                         stop(code in 200..399, if (code in 200..399) "" else "HTTP " + code)
                         return@evaluateJavascript
                     }
@@ -440,7 +558,6 @@ object HplaySubscribe {
                         stop(false, "fetch 异常")
                         return@evaluateJavascript
                     }
-                    // 状态码还是 -1：说明 fetch 还没回来，继续轮询即可（不重复提交）。
                 }
                 if (!finished) main.postDelayed(this, POLL_MS)
             }
@@ -448,12 +565,7 @@ object HplaySubscribe {
         main.post(r)
     }
 
-    /**
-     * 填表单 + 同源 fetch。所有分支都回一个可判定的字符串，不抛异常出去。
-     *
-     * @@begin == true@@ 时先清掉上一次的提交标记 —— 预热会话会被反复复用，
-     * 不清就会一直返回 "dup"，看起来像"点了没反应"。
-     */
+    /** 填表单 + 同源 fetch（所有分支都回一个可判定的字符串）。 */
     private fun jsFill(userId: String, artistId: String, status: String, begin: Boolean): String =
         "(function(begin){" +
             "try{" +
