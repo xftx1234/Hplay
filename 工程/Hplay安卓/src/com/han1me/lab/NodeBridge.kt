@@ -87,6 +87,9 @@ object NodeBridge {
             //   否则要等下次构件客户端才生效。
             GlobalProxy.set(activeHostPort, scope)
             LabLog.i("bridge", "GlobalProxy 已挂: " + activeHostPort + " scope=" + scope)
+            // ★ 第 356 轮：**挂载之后再打路由自检**。
+            // 上一版把它放在 LabInit 启动流程里，早于内核挂载 —— 打出来是 no-node，误导诊断。
+            runCatching { GlobalProxy.dumpRoutes() }
             // ★★★ 第 168 轮（用户要求「有 root 就全方位优化，没有也不影响」）：
             //
             // GlobalProxy 只覆盖 OkHttp（原生解析 / 下载）。**WebView 的网页播放走不到它** ——

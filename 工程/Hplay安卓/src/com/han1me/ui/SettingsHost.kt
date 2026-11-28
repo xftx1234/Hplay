@@ -74,21 +74,30 @@ fun HplaySettingsHost(
         )
         SettingsPage.APPEARANCE -> AppearanceSettingsScreen(onBack = ::back)
         SettingsPage.NETWORK -> SettingsScaffold("网络", ::back) {
+            // ★ 第 356 轮：旧键（net.javchu.route）已在 GlobalProxy 启动时清理，这里不再重复。
             // ★★★ 第 352 轮（用户要求「设置 网络里加一项 javchu 路由开关」）：**放在最上面**。
             //
             // 它是本页唯一一个「影响具体站点能否播放」的开关，比节点列表更需要先看到。
-            // 默认关（= 直连）：实测 t33.cdn2020.com 走内置节点一律 451，只有直连能播。
+            //
+            // ★★★ 第 356 轮：**默认值改成 proxy，与 GlobalProxy 的判定对齐**。
+            //
+            // 上一版这里默认 "direct"、而 GlobalProxy.javchuDirect() 又写反了（见那边的注释），
+            // 两处互相矛盾：界面显示「关（直连）」、实际也是直连，用户切到节点也没生效 ——
+            // 设备日志实证 javchu 19 条 Connection reset、内核里一条 accepted 都没有。
+            //
+            // 现在统一：**未设置 = 走节点**（javchu.com 是 Cloudflare 前置，直连必被 RST）；
+            // 只有显式写 "direct" 才直连。媒体域（cdn2020 / tutu1.space）不受本开关影响、永远直连。
             item {
                 val javchuProxy = remember {
                     mutableStateOf(
-                        com.han1me.X99.setting(com.han1me.lab.GlobalProxy.JAVCHU_ROUTE_KEY, "direct") == "proxy",
+                        com.han1me.X99.setting(com.han1me.lab.GlobalProxy.JAVCHU_ROUTE_KEY, "proxy") != "direct",
                     )
                 }
                 HplaySectionGroup("javchu 路由") {
                     HplaySwitchRow(
                         title = "javchu 走内置节点",
                         checked = javchuProxy.value,
-                        subtitle = "关闭（默认）= 直连。当前节点下 javchu 的媒体 CDN 对外国 IP 回 451，",
+                        subtitle = "开启（默认）= 走内置节点。javchu 页面站在 Cloudflare 后，直连必被 RST；",
                         icon = "🎬",
                         onCheckedChange = { on ->
                             javchuProxy.value = on

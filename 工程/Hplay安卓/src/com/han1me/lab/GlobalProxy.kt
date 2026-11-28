@@ -139,6 +139,15 @@ object GlobalProxy {
      */
     private val ALWAYS_DIRECT_SUFFIX = listOf(
         "tangxin.xyz",   // 糖心 CDN 的别名族（与 5gcdn.xyz 同一家）
+        // ★★★ 第 356 轮（用户明确要求「javchu 和 getchu 默认都走节点」）：**这里不放 getchu**。
+        //
+        // 我一度按美西节点的测量把 getchu.com 加进直连白名单（那次是 403），
+        // 但同一台设备换到新加坡节点后实测：
+        //   getchu via-node  200 / 92,026 字节 ✅
+        //   javchu via-node  200 / 309,209 字节 ✅
+        //   javchu direct    000（RST）
+        // 也就是说「能不能通」取决于节点，不是取决于域名 —— 给域名写死直连是本末倒置。
+        // 用户的要求就是走节点，那就走节点：**白名单只留真正节点不可达的 CDN**。
     )
 
     /**
@@ -153,7 +162,23 @@ object GlobalProxy {
      * 现在默认 proxy（页面能开），媒体域则独立地永远直连（见 [JAVCHU_MEDIA_HOSTS]）。
      */
     private fun javchuDirect(): Boolean = runCatching {
-        com.han1me.X99.setting(JAVCHU_ROUTE_KEY, "proxy") != "direct"
+        // ★★★ 第 356 轮（用户实测：切到新加坡节点后 javchu 仍然 RST）：**两个错叠在一起**。
+        //
+        // 错一（逻辑写反）：函数语义是「是否走直连」，上一版写
+        //   `setting(KEY, "proxy") != "direct"`
+        //   设置未写时默认 "proxy" ⇒ "proxy" != "direct" ⇒ **true ⇒ 直连**。
+        //
+        // 错二（旧值污染，这一条更隐蔽）：352–355 那几版**把 "direct" 写进了磁盘**
+        //（UI 默认就是 direct，用户点一下开关就落盘）。老设备上这个键
+        //   早就**明确等于 "direct"**，光把比较符改对还是走直连。
+        //
+        // 设备日志实证（hpla_lab.log，21:26–21:27）：19 条 javchu Connection reset，
+        // 内核日志里**一条 accepted tcp:javchu.com:443 都没有** —— 请求压根没进节点。
+        // 同机 curl 经节点 200 / 309,209 字节，证明节点本身没问题。
+        //
+        // 所以：**换键**（v2），老键一律作废、不读；v2 未写时按 proxy。
+        // 这样既修对了逻辑，也把被旧版本写脏的值一次清掉 —— 用户不用手动再点一遍。
+        com.han1me.X99.setting(JAVCHU_ROUTE_KEY_V2, "proxy") == "direct"
     }.getOrDefault(false)
 
     /**
@@ -188,6 +213,26 @@ object GlobalProxy {
         return false
     }
 
+    /**
+     * ★★★ 第 356 轮（用户要求「默认都走节点，且完美加载快速」）：**按参考源码的结构收敛**。
+     *
+     * 参考实现（Han1meViewer · `HProxySelector.select(uri)`）里没有任何按域名的例外表：
+     *
+     * ```kotlin
+     * if (type == TYPE_SOCKS || type == TYPE_HTTP) {
+     *     return mutableListOf(Proxy(SOCKS, InetSocketAddress(ip, port)))  // 无条件
+     * }
+     * ```
+     *
+     * Han1mePlus 同理（一个 ProxySelector 统管，无 host 白名单）。
+     * 我们这边 `ALWAYS_DIRECT` 是历史累积的例外表 —— 每遇到一个「某站直连更快」就加一条，
+     * 结果「全局代理」名存实亡，而且这些条目**都是按某一台节点测出来的**，换节点即失效
+     * （getchu 就是这么被误判的：美西 403 → 加白名单 → 新加坡 200 反而被绕掉）。
+     *
+     * 现在的口径：**只有「节点确实不可达」的 CDN 才直连**，其余一律走节点。
+     * 仍保留 [ALWAYS_DIRECT] 那几条，因为它们是媒体 CDN（走节点回 451 / 证书不匹配），
+     * 与「页面站能不能开」是两件事。
+     */
     private fun alwaysDirect(host: String): Boolean {
         val h = host.lowercase()
         // ★★★ 第 353 轮：javchu 的**媒体域永远直连**（不受开关影响）。
@@ -201,8 +246,44 @@ object GlobalProxy {
         return false
     }
 
-    /** 设置键（设置页读写同一个）。 */
-    const val JAVCHU_ROUTE_KEY = "net.javchu.route"
+    /** 旧设置键（352–355 版用过）。已作废，只保留给迁移时读取/清理。 */
+    const val JAVCHU_ROUTE_KEY_LEGACY = "net.javchu.route"
+
+    /** 设置键（设置页读写同一个）。★ 第 356 轮换新键，避开旧版本写脏的 direct。 */
+    const val JAVCHU_ROUTE_KEY_V2 = "net.javchu.route.v2"
+
+    /** 兼容名：仍指向**新**键，避免调用点全改一遍。 */
+    const val JAVCHU_ROUTE_KEY = JAVCHU_ROUTE_KEY_V2
+
+    /**
+     * **路由自检**（第 356 轮）：启动时把关键域的实际选路打进日志。
+     *
+     * 为什么需要：javchu / getchu 这类"能不能开"的问题，过去只能靠猜 ——
+     * 界面显示走节点、实际走直连，日志里只有一条 Connection reset，看不出是谁决定的。
+     * 现在启动就打印一行，下次一眼就知道「这条路是 always-direct / bypass / via-node」。
+     */
+    fun dumpRoutes() = runCatching {
+        val hosts = listOf(
+            "hanime1.me", "javchu.com", "www.getchu.com",
+            "t33.cdn2020.com", "tutu1.space", "t.5gcdn.xyz",
+        )
+        val parts = hosts.map { it + "=" + directReason(it) }
+        LabLog.i("proxy", "路由自检 active=" + active + " scope=" + scope + " | " + parts.joinToString(" "))
+    }
+
+    /**
+     * 清理 352–355 版写下的旧键（值为 "direct" 会让诊断看起来像"用户选了直连"）。
+     *
+     * 叫这个名字而不是放在 UI 里，是因为它必须在**任何界面组合之前**跑完；
+     * 放 SettingsHost 的 content lambda 里会撞上「非 Composable 上下文」编译错误。
+     */
+    fun cleanupLegacyKey() = runCatching {
+        val old = com.han1me.X99.setting(JAVCHU_ROUTE_KEY_LEGACY, "")
+        if (old.isNotBlank()) {
+            com.han1me.X99.putSetting(JAVCHU_ROUTE_KEY_LEGACY, "")
+            LabLog.i("proxy", "已清理旧 javchu 路由键（原值 " + old + "，现按 v2 走节点）")
+        }
+    }
 
     /**
      * 第 351 轮：**这个 host 现在走哪条路**（诊断用，日志里能直接读出结论）。

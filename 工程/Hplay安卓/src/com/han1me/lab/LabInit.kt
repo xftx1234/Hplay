@@ -68,6 +68,9 @@ object LabInit {
         // ★ 2026-11-25：回灌上次的 cf_clearance（否则每次启动都要重新过盾，
         //   而「首页能看、登录 403」正是 clearance 过期的表现）
         runCatching { CfCookieBridge.restoreAtStartup() }
+        // ★ 第 356 轮：清掉 352–355 版写进磁盘的 javchu 旧路由键（值为 direct），
+        // 否则新代码读 v2 之外还留着它，诊断时会误判成"用户选了直连"。
+        runCatching { GlobalProxy.cleanupLegacyKey() }
         // ★ 2026-11-25（第 297 轮）：**冷启动恢复登录态**。
         // 用户要求「一次登陆成功后永久保存 cookie，之后不用再次网页登录」。
         // 落盘在 CfCookieBridge.persistLogin，这里灌回 OkHttp。

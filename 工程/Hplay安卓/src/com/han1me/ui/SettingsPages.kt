@@ -25,20 +25,22 @@ fun NetworkSettingsContent() {
     val cs = MaterialTheme.colorScheme
     // ★★ 第 352 轮（用户要求「设置 网络里加一项 javchu 路由开关，可切换走直连还是代理」）：
     //
-    // 默认 direct。理由是**实测**而不是偏好：t33.cdn2020.com（javchu 的媒体域）
-    // 直连 200 + 完整 m3u8 + 分片全 200；经内置节点（美西）一律 **451**
-    // （Server: Quantum，「因法律原因不可用」只对外国 IP 生效）。
-    // 留开关是因为换个节点可能就通了 —— "走代理" 在别的节点上是合理选项。
+    // 默认 **proxy**（走节点）。javchu.com 是 Cloudflare 前置，直连必被 RST ——
+    // 设备日志实证：19 条 `Connection reset`，内核里一条 `accepted tcp:javchu.com:443` 都没有。
+    // 媒体域（cdn2020.com / tutu1.space）是另一套判据、**永远直连**，不受本开关影响。
+    //
+    // ★ 第 356 轮：本函数当前是死代码（网络页渲染走 SettingsHost），
+    // 但默认值必须与 GlobalProxy.javchuDirect() 保持一致，否则将来一旦被接回去就会再犯同一个错。
     var javchuProxy by remember {
-        mutableStateOf(com.han1me.X99.setting(com.han1me.lab.GlobalProxy.JAVCHU_ROUTE_KEY, "direct") == "proxy")
+        mutableStateOf(com.han1me.X99.setting(com.han1me.lab.GlobalProxy.JAVCHU_ROUTE_KEY, "proxy") != "direct")
     }
     Column {
         HplaySectionGroup("javchu 路由") {
             HplaySwitchRow(
                 title = "javchu 走内置节点",
                 checked = javchuProxy,
-                subtitle = "关闭（默认）= 直连。当前节点下 javchu 的媒体 CDN 对外国 IP 回 451，" +
-                    "只有直连才播得了；换节点后若代理更快可打开。",
+                subtitle = "开启（默认）= 走内置节点。javchu 页面站在 Cloudflare 后，直连必被 RST；" +
+                    "媒体 CDN 不受本开关影响（永远直连）。",
                 icon = "🌐",
                 onCheckedChange = { on ->
                     javchuProxy = on
